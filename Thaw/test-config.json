@@ -1,0 +1,16 @@
+{
+  "AltF4Mode": "always",
+  "PanicHotkey": "Ctrl+Alt+U",
+  "AutoUnfreezeOnStall": true,
+  "ShowBalloons": true,
+  "DebugLog": false,
+  "StallThresholdMs": 2500,
+  "HardStallMs": 6000,
+  "CpuStressPercent": 90,
+  "MemStressPercent": 92,
+  "PowerPlanBoost": true,
+  "PowerPlanRestoreAfterSeconds": 120,
+  "RestartExplorerOnUnfreeze": true,
+  "ResetGpuDriver": true,
+  "RestartDwmOnFrozenScreen": true
+}
