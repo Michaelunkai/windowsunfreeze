@@ -611,6 +611,39 @@ internal sealed class Unfreezer : IDisposable
         {
             Log.Error("Unfreeze failed", ex);
             try { journal.RollbackAll(); } catch { }
+            try
+            {
+                // Always publish a terminal result, including failures before
+                // dispatch. The tray guard and integrations must be able to
+                // retry immediately instead of waiting for a stale timeout.
+                var failure = new UnfreezeStats(
+                    counters.WorkingSetsTrimmed,
+                    _lastAppsBoosted,
+                    0,
+                    sw.ElapsedMilliseconds,
+                    reason,
+                    gpuReset,
+                    dwmRestarted,
+                    explorerRestarted)
+                {
+                    ProcessesScanned = counters.ProcessesScanned,
+                    ProcessesSkipped = counters.ProcessesSkipped,
+                    WorkingSetsTrimmed = counters.WorkingSetsTrimmed,
+                    WorkingSetFailures = counters.WorkingSetFailures,
+                    ActionsSucceeded = counters.ActionsSucceeded,
+                    ActionsSkipped = counters.ActionsSkipped,
+                    BudgetExpired = Environment.TickCount64 >= deadline,
+                    ForegroundPid = counters.ForegroundPid,
+                    PrimaryCause = primaryCause,
+                    OverallOutcome = RecoveryOutcome.Unverified,
+                    Diagnostics = counters.DiagnosticSummary() + ",run-exception=" + ex.GetType().Name,
+                };
+                Completed?.Invoke(failure);
+            }
+            catch (Exception notifyEx)
+            {
+                Log.Error("Unable to publish failed recovery result", notifyEx);
+            }
         }
         finally
         {

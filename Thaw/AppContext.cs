@@ -85,12 +85,25 @@ internal sealed class AppContext : ApplicationContext
         {
             if (_config.AutoUnfreezeOnStall) RequestUnfreeze(TriggerReason.Auto);
         };
-        _unfreezer.Completed += stats => _ui.Post(_ => OnUnfreezeCompleted(stats), null);
-        _unfreezer.ExplorerRestartedNow += () => _ui.Post(_ =>
+        _unfreezer.Completed += stats =>
+        {
+            // Release the retry fence before optional UI marshaling. If the
+            // message loop is shutting down, a failed Post must not suppress
+            // the next emergency shortcut for the stale-guard interval.
+            Volatile.Write(ref _recoveryInProgress, 0);
+            try { _ui.Post(_ => OnUnfreezeCompleted(stats), null); }
+            catch (Exception ex)
+            {
+                _lastRecoveryOutcome = "Recovery completed; tray update unavailable.";
+                Log.Error("Recovery completion UI post failed", ex);
+            }
+        };
+        _unfreezer.ExplorerRestartedNow += () =>
         {
             MarkShellRecoveryCompleted();
-            ReAddTrayIcon();
-        }, null);
+            try { _ui.Post(_ => ReAddTrayIcon(), null); }
+            catch (Exception ex) { Log.Error("Explorer completion UI post failed", ex); }
+        };
 
         // Tray.
         _tray = new NotifyIcon
@@ -355,7 +368,21 @@ internal sealed class AppContext : ApplicationContext
 
         Interlocked.Exchange(ref _lastRecoveryRequestTick, now);
         Volatile.Write(ref _lastRecoveryReason, (int)reason);
-        bool accepted = _unfreezer.Trigger(reason);
+        bool accepted;
+        try
+        {
+            accepted = _unfreezer.Trigger(reason);
+        }
+        catch (Exception ex)
+        {
+            // A startup/resource race must release the UI fence immediately;
+            // otherwise every later shortcut would be suppressed until the
+            // 60-second stale-guard timeout.
+            Interlocked.Exchange(ref _recoveryInProgress, 0);
+            _lastRecoveryOutcome = "Recovery could not start; retry is available.";
+            Log.Error($"Recovery request ({reason}) failed before handoff", ex);
+            return;
+        }
         // The recovery worker is pre-warmed and must receive the request before
         // synchronous log I/O can contend with the shortcut handoff.
         Log.Info($"Recovery requested ({reason}) — normal/cooldown guard accepted");
@@ -415,25 +442,34 @@ internal sealed class AppContext : ApplicationContext
         bool playSound = _config.PlayRecoverySound;
         bool showBalloon = _config.ShowImmediateCaptureFeedback && _config.ShowBalloons;
         bool showOverlay = _config.ShowCaptureOverlay;
-        _ui.Post(_ =>
+        try
         {
-            try
+            _ui.Post(_ =>
             {
-                if (playSound)
+                try
                 {
-                    try { SystemSounds.Asterisk.Play(); }
-                    catch (Exception ex) { Log.Debug("Recovery sound unavailable: " + ex.Message); }
+                    if (playSound)
+                    {
+                        try { SystemSounds.Asterisk.Play(); }
+                        catch (Exception ex) { Log.Debug("Recovery sound unavailable: " + ex.Message); }
+                    }
+                    if (showBalloon)
+                        _tray.ShowBalloonTip(1500, "Thaw", label, ToolTipIcon.Info);
+                    if (showOverlay)
+                        ShowCaptureOverlay(label);
                 }
-                if (showBalloon)
-                    _tray.ShowBalloonTip(1500, "Thaw", label, ToolTipIcon.Info);
-                if (showOverlay)
-                    ShowCaptureOverlay(label);
-            }
-            catch (Exception ex)
-            {
-                Log.Debug("Immediate recovery feedback failed: " + ex.Message);
-            }
-        }, null);
+                catch (Exception ex)
+                {
+                    Log.Debug("Immediate recovery feedback failed: " + ex.Message);
+                }
+            }, null);
+        }
+        catch (Exception ex)
+        {
+            // Feedback is optional; never let a dead UI context prevent the
+            // dispatch worker from acknowledging the already-accepted rescue.
+            Log.Error("Immediate recovery feedback post failed", ex);
+        }
     }
 
     private void ShowCaptureOverlay(string text)

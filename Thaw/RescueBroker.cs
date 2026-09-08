@@ -49,6 +49,7 @@ public sealed class RescueBroker : IDisposable
     private Action<RescueSignal>? _handler;
     private RescueSignal _lastSignal;
     private long _sequence;
+    private long _lastPublishedSequence;
     private long _lastAcknowledgedSequence;
     private int _disposed;
     private int _listening;
@@ -170,11 +171,10 @@ public sealed class RescueBroker : IDisposable
             DateTime.UtcNow.Ticks,
             reason);
 
-        lock (_gate) _lastSignal = signal;
-
         try
         {
-            _signalEvent.Set();
+            if (!_signalEvent.Set()) return false;
+            MarkPublished(signal, nonBlocking: false);
             return true;
         }
         catch (Exception ex)
@@ -217,19 +217,18 @@ public sealed class RescueBroker : IDisposable
             DateTime.UtcNow.Ticks,
             reason);
 
-        // Diagnostics should never be able to delay the capture edge. Publish a
-        // best-effort local copy only when the lock is immediately available.
-        if (Monitor.TryEnter(_gate))
-        {
-            try { _lastSignal = signal; }
-            finally { Monitor.Exit(_gate); }
-        }
-
         try
         {
             IntPtr handle = _signalEvent.SafeWaitHandle.DangerousGetHandle();
             bool published = handle != IntPtr.Zero && Native.SetEvent(handle);
-            if (!published) sequence = 0;
+            if (!published)
+            {
+                sequence = 0;
+                return false;
+            }
+            // Diagnostics should never be able to delay the capture edge. The
+            // native pulse is already committed; this metadata update is best effort.
+            MarkPublished(signal, nonBlocking: true);
             return published;
         }
         catch
@@ -250,9 +249,11 @@ public sealed class RescueBroker : IDisposable
         try
         {
             long effectiveSequence = sequence == 0
-                ? Interlocked.Read(ref _sequence)
+                ? Interlocked.Read(ref _lastPublishedSequence)
                 : sequence;
-            if (effectiveSequence <= 0) return false;
+            if (effectiveSequence <= 0 ||
+                effectiveSequence > Interlocked.Read(ref _lastPublishedSequence))
+                return false;
             return TryPublishAcknowledgement(effectiveSequence);
         }
         catch (Exception ex)
@@ -268,7 +269,7 @@ public sealed class RescueBroker : IDisposable
     /// </summary>
     public bool TryAcknowledgeFast()
     {
-        long sequence = Interlocked.Read(ref _sequence);
+        long sequence = Interlocked.Read(ref _lastPublishedSequence);
         return TryAcknowledgeFast(sequence);
     }
 
@@ -280,7 +281,8 @@ public sealed class RescueBroker : IDisposable
 
         try
         {
-            if (sequence <= 0) return false;
+            if (sequence <= 0 || sequence > Interlocked.Read(ref _lastPublishedSequence))
+                return false;
             return TryPublishAcknowledgement(sequence);
         }
         catch
@@ -321,6 +323,7 @@ public sealed class RescueBroker : IDisposable
             if (Volatile.Read(ref _disposed) != 0 || _acknowledgementEvent is null)
                 return false;
 
+            if (sequence > Volatile.Read(ref _lastPublishedSequence)) return false;
             if (sequence <= Volatile.Read(ref _lastAcknowledgedSequence))
                 return true;
 
@@ -357,6 +360,7 @@ public sealed class RescueBroker : IDisposable
                         DateTime.UtcNow.Ticks,
                         "named-event");
                     _lastSignal = signal;
+                    AdvancePublishedSequence(signal.Sequence);
                 }
             }
             return true;
@@ -378,6 +382,11 @@ public sealed class RescueBroker : IDisposable
             catch (Exception ex)
             {
                 Log.Debug("Rescue broker listener wait failed: " + ex.Message);
+                if (Volatile.Read(ref _disposed) == 0)
+                {
+                    try { Thread.Sleep(50); } catch { }
+                    continue;
+                }
                 break;
             }
 
@@ -395,6 +404,7 @@ public sealed class RescueBroker : IDisposable
                         DateTime.UtcNow.Ticks,
                         "named-event");
                     _lastSignal = signal;
+                    AdvancePublishedSequence(signal.Sequence);
                 }
             }
 
@@ -402,6 +412,38 @@ public sealed class RescueBroker : IDisposable
         }
 
         Volatile.Write(ref _listening, 0);
+    }
+
+    private void MarkPublished(RescueSignal signal, bool nonBlocking)
+    {
+        AdvancePublishedSequence(signal.Sequence);
+        if (nonBlocking)
+        {
+            if (!Monitor.TryEnter(_gate)) return;
+            try
+            {
+                if (signal.Sequence >= _lastSignal.Sequence) _lastSignal = signal;
+            }
+            finally { Monitor.Exit(_gate); }
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (signal.Sequence >= _lastSignal.Sequence) _lastSignal = signal;
+        }
+    }
+
+    private void AdvancePublishedSequence(long sequence)
+    {
+        if (sequence <= 0) return;
+        while (true)
+        {
+            long previous = Volatile.Read(ref _lastPublishedSequence);
+            if (previous >= sequence) return;
+            if (Interlocked.CompareExchange(ref _lastPublishedSequence, sequence, previous) == previous)
+                return;
+        }
     }
 
     private void Dispatch(RescueSignal signal)

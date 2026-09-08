@@ -19,6 +19,10 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private const uint HealthTimerId = 0x5BFF;
     private const int HealthTimerIntervalMs = 5_000;
     private const int ForcedRenewalIntervalMs = 30_000;
+    private const uint WAIT_TIMEOUT = 0x00000102;
+    private const uint WAIT_FAILED = 0xFFFFFFFF;
+    private const uint QS_ALLINPUT = 0x04FF;
+    private const uint MWMO_INPUTAVAILABLE = 0x0004;
 
     private readonly string _configPath;
     private readonly Action<RecoveryHotkeyBinding> _onHotkey;
@@ -80,6 +84,24 @@ internal sealed class RescueHotkeyMonitor : IDisposable
             {
                 try
                 {
+                    uint waitResult = MsgWaitForMultipleObjectsEx(
+                        0, IntPtr.Zero, (uint)HealthTimerIntervalMs, QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE);
+                    if (waitResult == WAIT_TIMEOUT)
+                    {
+                        // This is also the fallback health tick when SetTimer
+                        // was rejected or stopped delivering WM_TIMER.
+                        MaintainRegistrations();
+                        continue;
+                    }
+                    if (waitResult == WAIT_FAILED)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0) break;
+                        MaintainRegistrations();
+                        try { Thread.Sleep(50); } catch { }
+                        continue;
+                    }
+
                     int result = GetMessage(out Message message, IntPtr.Zero, 0, 0);
                     if (result == 0)
                     {
@@ -348,6 +370,14 @@ internal sealed class RescueHotkeyMonitor : IDisposable
         uint minFilter,
         uint maxFilter,
         uint removeMessage);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint MsgWaitForMultipleObjectsEx(
+        uint count,
+        IntPtr handles,
+        uint milliseconds,
+        uint wakeMask,
+        uint flags);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern int GetMessage(

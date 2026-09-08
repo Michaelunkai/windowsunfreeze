@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.8**
+Version **1.4.9**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -92,7 +92,11 @@ application memory or process dumps.
   clearing already-captured requests; the final worker is an independent pre-warmed
   last-resort slot. Each event subscriber is isolated individually, and AltGr text input
   is excluded from Ctrl+Alt recovery matching. Recovery requests are handed to a pre-warmed
-  high-priority worker, with bounded recreation only if that worker itself exits.
+  high-priority worker, with bounded recreation only if that worker itself exits. A capture
+  carries the exact successfully-published rescue sequence through dispatch; failed event
+  pulses cannot acknowledge an older request. Both dispatch workers poll their queues when a
+  wake pulse fails, and the hook message loops perform bounded health ticks even if a timer
+  stops delivering messages.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic,
   frame-drop, and Alt+F4 (when `AltF4Mode` is `always`) chords with `RegisterHotKey`; the
@@ -101,8 +105,9 @@ application memory or process dumps.
   is an emergency fallback, not a second normal recovery loop, and it never runs arbitrary
   commands. Its registered-hotkey message loop re-registers after a recoverable
   message/queue failure, retries rejected registrations, renews them periodically, and
-  refreshes its registrations after a live config change; the parent helper recreates the
-  monitor thread if it exits.
+  refreshes its registrations after a live config change; bounded message-queue polling keeps
+  those health checks alive if `SetTimer` fails. The parent helper recreates the monitor thread
+  if it exits.
 - **Watchdog** (`Watchdog.cs`) — samples scheduling delay, CPU, and RAM each second.
   It drives the alert icon and can request automatic recovery after a hard stall when
   `AutoUnfreezeOnStall` is enabled. Automatic recovery is deliberately diagnostics-only;
@@ -126,7 +131,9 @@ application memory or process dumps.
   optional sound and UI feedback are posted asynchronously after handoff, and individual
   pre-dispatch probe failures are isolated so they cannot cancel recovery. Evidence probes
   run independently within their own deadlines, and a wait-boundary fault still closes the
-  batch while preserving the active-run fence until late workers drain.
+  batch while preserving the active-run fence until late workers drain. Failed runs publish a
+  terminal unverified result so the tray can release its retry guard immediately, even when
+  optional UI marshaling is unavailable.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|

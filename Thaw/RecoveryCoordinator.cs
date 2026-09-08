@@ -281,6 +281,7 @@ internal sealed class RecoveryDispatch
     internal long RunDeadlineTick => _runDeadlineTick;
     internal bool IsComplete => Volatile.Read(ref _remaining) == 0;
     internal bool IsDrained => Volatile.Read(ref _workersRemaining) == 0;
+    internal bool IsClosed => Volatile.Read(ref _closed) != 0;
     internal IReadOnlyList<PendingAction> Items => _items;
 
     internal void Add(PendingAction item)
@@ -524,18 +525,18 @@ internal sealed class RecoveryCoordinator : IDisposable
             // Keep the coordinator reservation until every old worker has
             // actually left the batch. This prevents a late native mutation
             // and its rollback from overlapping a newer recovery run.
-            var drainThread = new Thread(() =>
-            {
-                try { dispatch.WaitForDrain(); }
-                finally { Interlocked.Exchange(ref _activeDispatch, 0); }
-            })
-            {
-                IsBackground = true,
-                Name = "Thaw.RecoveryDrain",
-            };
-            TrySetPriority(drainThread, ThreadPriority.BelowNormal, drainThread.Name);
             try
             {
+                var drainThread = new Thread(() =>
+                {
+                    try { dispatch.WaitForDrain(); }
+                    finally { Interlocked.Exchange(ref _activeDispatch, 0); }
+                })
+                {
+                    IsBackground = true,
+                    Name = "Thaw.RecoveryDrain",
+                };
+                TrySetPriority(drainThread, ThreadPriority.BelowNormal, drainThread.Name);
                 drainThread.Start();
             }
             catch (Exception ex)
@@ -687,6 +688,14 @@ internal sealed class RecoveryCoordinator : IDisposable
         RecoveryDispatch? dispatch = item.Batch;
         if (spec is null || context is null || dispatch is null) return;
         if (Volatile.Read(ref item.State) != 0) return;
+        if (dispatch.IsClosed)
+        {
+            // A wait boundary may have faulted before its normal expiry pass.
+            // Do not start a queued native mutation after the batch is closed.
+            dispatch.Complete(item, RecoveryOutcome.Unverified,
+                "dispatch closed before action execution");
+            return;
+        }
 
         item.StartedTick = Environment.TickCount64;
         dispatch.Receipt(spec.Name, RecoveryReceiptPhase.Started, RecoveryOutcome.Unverified,

@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.8)
+## Capture-path hardening (1.4.8–1.4.9)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -407,6 +407,23 @@ single hook does not erase the user's emergency request:
 11. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.
+12. **Transactional rescue publication** — a rescue sequence becomes acknowledgeable only
+   after the native signal event accepts it. A failed pulse returns sequence zero, so a later
+   delivery cannot accidentally acknowledge an older published capture.
+13. **Bounded wake recovery** — normal and emergency dispatch workers poll their pre-warmed
+   slots on a short interval in addition to the event wake. A transient event-handle or
+   `SetEvent` failure therefore leaves the captured request available for delivery.
+14. **Timer-independent hook health** — primary and emergency low-level-hook loops, plus the
+   registered-hotkey monitor, use bounded `MsgWaitForMultipleObjectsEx` polling. Heartbeats,
+   hook renewal, and fallback registration maintenance continue when `SetTimer` fails or
+   silently stops producing `WM_TIMER` messages.
+15. **Native callback containment** — the `CallNextHookEx` pass-through is guarded so an
+   exceptional native chain call cannot escape into Windows' low-level hook dispatcher or
+   terminate the capture thread.
+16. **Terminal failure release** — engine failures publish an explicit unverified completion,
+   trigger failures release the tray retry fence immediately, and optional UI posts are
+   guarded. A closed dispatch also completes queued actions as skipped instead of starting a
+   late native mutation.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

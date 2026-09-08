@@ -40,13 +40,15 @@ internal readonly struct KeyboardCaptureReceipt
         RecoveryHotkeyAction action,
         string hotkey,
         long capturedAtStopwatchTicks,
-        long capturedAtUtcTicks)
+        long capturedAtUtcTicks,
+        long rescueSequence = 0)
     {
         Sequence = sequence;
         Action = action;
         Hotkey = hotkey;
         CapturedAtStopwatchTicks = capturedAtStopwatchTicks;
         CapturedAtUtcTicks = capturedAtUtcTicks;
+        RescueSequence = rescueSequence;
     }
 
     public long Sequence { get; }
@@ -54,6 +56,8 @@ internal readonly struct KeyboardCaptureReceipt
     public string Hotkey { get; }
     public long CapturedAtStopwatchTicks { get; }
     public long CapturedAtUtcTicks { get; }
+    /// <summary>Exact rescue-broker sequence, or zero when no rescue pulse was published.</summary>
+    public long RescueSequence { get; }
     public DateTime CapturedAtUtc => new(CapturedAtUtcTicks, DateTimeKind.Utc);
 }
 
@@ -80,6 +84,11 @@ internal sealed class KeyboardHook : IDisposable
     private const uint WM_APP_RESCUE_REINSTALL = WM_APP + 0x44;
     private const uint HOOK_TIMER_ID = 0x5448;
     private const uint RESCUE_HOOK_TIMER_ID = 0x5449;
+    private const uint WAIT_TIMEOUT = 0x00000102;
+    private const uint WAIT_FAILED = 0xFFFFFFFF;
+    private const uint QS_ALLINPUT = 0x04FF;
+    private const uint MWMO_INPUTAVAILABLE = 0x0004;
+    private const uint MESSAGE_POLL_MS = 500;
     private const int HOOK_HEARTBEAT_INTERVAL_MS = 250;
     private const int HOOK_STALE_MS = 2500;
     private const int HOOK_RENEWAL_MS = 3000;
@@ -331,7 +340,7 @@ internal sealed class KeyboardHook : IDisposable
     public bool AcknowledgeLastCapture()
     {
         KeyboardCaptureReceipt capture = LastCapture;
-        return capture.Sequence != 0 && _rescueBroker.Acknowledge(capture.Sequence);
+        return capture.RescueSequence != 0 && _rescueBroker.Acknowledge(capture.RescueSequence);
     }
 
     /// <summary>Heartbeat age in milliseconds, useful to a support/diagnostics surface.</summary>
@@ -578,6 +587,21 @@ internal sealed class KeyboardHook : IDisposable
 
             while (Volatile.Read(ref _disposed) == 0)
             {
+                uint waitResult = MsgWaitForMultipleObjectsEx(
+                    0, IntPtr.Zero, MESSAGE_POLL_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if (waitResult == WAIT_TIMEOUT)
+                {
+                    HookHeartbeat();
+                    continue;
+                }
+                if (waitResult == WAIT_FAILED)
+                {
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    HookHeartbeat();
+                    try { Thread.Sleep(25); } catch { }
+                    continue;
+                }
+
                 int result = GetMessage(out HookMessage message, IntPtr.Zero, 0, 0);
                 if (result <= 0) break;
 
@@ -649,6 +673,21 @@ internal sealed class KeyboardHook : IDisposable
 
             while (Volatile.Read(ref _disposed) == 0)
             {
+                uint waitResult = MsgWaitForMultipleObjectsEx(
+                    0, IntPtr.Zero, MESSAGE_POLL_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if (waitResult == WAIT_TIMEOUT)
+                {
+                    RescueHookHeartbeat();
+                    continue;
+                }
+                if (waitResult == WAIT_FAILED)
+                {
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    RescueHookHeartbeat();
+                    try { Thread.Sleep(25); } catch { }
+                    continue;
+                }
+
                 int result = GetMessage(out HookMessage message, IntPtr.Zero, 0, 0);
                 if (result <= 0) break;
 
@@ -765,14 +804,14 @@ internal sealed class KeyboardHook : IDisposable
                 {
                     var kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
                     if ((kbd.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0)
-                        return Native.CallNextHookEx(_rescueHandle, nCode, wParam, lParam);
+                        return CallNextHook(_rescueHandle, nCode, wParam, lParam);
 
                     bool keyUp = msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP ||
                                  (kbd.flags & LLKHF_UP) != 0;
                     if (keyUp)
                     {
                         _rescueDownKeys.Remove(kbd.vkCode);
-                        return Native.CallNextHookEx(_rescueHandle, nCode, wParam, lParam);
+                        return CallNextHook(_rescueHandle, nCode, wParam, lParam);
                     }
 
                     bool repeat = !_rescueDownKeys.Add(kbd.vkCode);
@@ -830,7 +869,7 @@ internal sealed class KeyboardHook : IDisposable
             Interlocked.Increment(ref _callbackErrorCount);
         }
 
-        return Native.CallNextHookEx(_rescueHandle, nCode, wParam, lParam);
+        return CallNextHook(_rescueHandle, nCode, wParam, lParam);
     }
 
     private static bool IsKeyDown(int virtualKey) =>
@@ -1035,7 +1074,10 @@ internal sealed class KeyboardHook : IDisposable
             {
                 try
                 {
-                    _dispatchWake.WaitOne();
+                    // The event is the fast wake-up, but a short bounded poll
+                    // prevents a transient Set/handle failure from stranding
+                    // a queued capture forever.
+                    _dispatchWake.WaitOne(100);
                     while (TryTakeDispatch(out DispatchSlot slot))
                     {
                         try { DeliverDispatch(slot); }
@@ -1087,7 +1129,9 @@ internal sealed class KeyboardHook : IDisposable
             {
                 try
                 {
-                    _fallbackDispatchWake.WaitOne();
+                    // Keep a bounded poll so a transient wake-handle failure
+                    // cannot strand the reserved emergency delivery slot.
+                    _fallbackDispatchWake.WaitOne(100);
                     if (Interlocked.CompareExchange(ref _fallbackDispatchState, 2, 1) == 1)
                     {
                         try { DeliverDispatch(_fallbackDispatchSlot); }
@@ -1182,12 +1226,8 @@ internal sealed class KeyboardHook : IDisposable
 
             // Acknowledge only after a live dispatch worker has delivered the
             // request. Queue insertion alone is not proof that recovery can run.
-            if (delivered)
-            {
-                _ = slot.RescueSequence > 0
-                    ? _rescueBroker.TryAcknowledgeFast(slot.RescueSequence)
-                    : _rescueBroker.TryAcknowledgeFast();
-            }
+            if (delivered && slot.RescueSequence > 0)
+                _ = _rescueBroker.TryAcknowledgeFast(slot.RescueSequence);
         }
 
         ClearDispatchSlot(slot);
@@ -1268,7 +1308,7 @@ internal sealed class KeyboardHook : IDisposable
                     // never injects input, this prevents another automation tool from
                     // accidentally triggering a recovery action or corrupting modifier state.
                     if ((kbd.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0)
-                        return Native.CallNextHookEx(_handle, nCode, wParam, lParam);
+                        return CallNextHook(_handle, nCode, wParam, lParam);
 
                     bool keyUp = msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP ||
                                  (kbd.flags & LLKHF_UP) != 0;
@@ -1279,7 +1319,7 @@ internal sealed class KeyboardHook : IDisposable
                     if (keyUp)
                     {
                         _downKeys.Remove(kbd.vkCode);
-                        return Native.CallNextHookEx(_handle, nCode, wParam, lParam);
+                        return CallNextHook(_handle, nCode, wParam, lParam);
                     }
 
                     bool repeat = !_downKeys.Add(kbd.vkCode);
@@ -1339,7 +1379,7 @@ internal sealed class KeyboardHook : IDisposable
             // hook. The next callback can still preserve the capture path.
             Interlocked.Increment(ref _callbackErrorCount);
         }
-        return Native.CallNextHookEx(_handle, nCode, wParam, lParam);
+        return CallNextHook(_handle, nCode, wParam, lParam);
     }
 
     private bool ShouldInterceptAltF4()
@@ -1477,7 +1517,8 @@ internal sealed class KeyboardHook : IDisposable
                     slot.LegacyCallback = legacyCallback;
                     slot.RescueSequence = rescueSequence;
                     _dispatchQueue.Enqueue(slot);
-                    _dispatchWake.Set();
+                    try { _dispatchWake.Set(); }
+                    catch { Interlocked.Increment(ref _callbackErrorCount); }
                     return true;
                 }
             }
@@ -1496,13 +1537,7 @@ internal sealed class KeyboardHook : IDisposable
             _emergencyDispatchSlot.RescueSequence = rescueSequence;
             Volatile.Write(ref _emergencyDispatchState, 1);
             try { _dispatchWake.Set(); }
-            catch
-            {
-                _emergencyDispatchSlot.Args = null;
-                _emergencyDispatchSlot.LegacyCallback = null;
-                _emergencyDispatchSlot.RescueSequence = 0;
-                Volatile.Write(ref _emergencyDispatchState, 0);
-            }
+            catch { Interlocked.Increment(ref _callbackErrorCount); }
             return true;
         }
 
@@ -1520,12 +1555,7 @@ internal sealed class KeyboardHook : IDisposable
                 _fallbackDispatchWake.Set();
                 return true;
             }
-            catch
-            {
-                _fallbackDispatchSlot.Args = null;
-                _fallbackDispatchSlot.LegacyCallback = null;
-                Volatile.Write(ref _fallbackDispatchState, 0);
-            }
+            catch { Interlocked.Increment(ref _callbackErrorCount); return true; }
         }
 
         // This is only reachable after an unusually large burst or simultaneous
@@ -1538,18 +1568,19 @@ internal sealed class KeyboardHook : IDisposable
     private long RecordCapture(RecoveryHotkeyEventArgs args)
     {
         long sequence = Interlocked.Increment(ref _captureCount);
+        _ = _rescueBroker.TrySignalFast(args.Hotkey, out long rescueSequence);
         var receipt = new KeyboardCaptureReceipt(
             sequence,
             args.Action,
             args.Hotkey,
             Stopwatch.GetTimestamp(),
-            DateTime.UtcNow.Ticks);
+            DateTime.UtcNow.Ticks,
+            rescueSequence);
         Volatile.Write(ref _lastCapture, new CaptureBox(receipt));
 
         // Signal before queueing the typed event. A helper waiting on the named
         // event therefore receives a capture pulse even if the main dispatcher
         // is briefly starved or the UI thread is blocked.
-        _ = _rescueBroker.TrySignalFast(args.Hotkey, out long rescueSequence);
         return rescueSequence;
     }
 
@@ -1695,6 +1726,19 @@ internal sealed class KeyboardHook : IDisposable
         }
     }
 
+    private IntPtr CallNextHook(IntPtr handle, int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        try { return Native.CallNextHookEx(handle, nCode, wParam, lParam); }
+        catch
+        {
+            // Passing zero is the documented pass-through result when the
+            // optional native chain call is unavailable; never let an exception
+            // escape back into Windows' low-level hook dispatcher.
+            Interlocked.Increment(ref _callbackErrorCount);
+            return IntPtr.Zero;
+        }
+    }
+
     private static long ToStopwatchTicks(int milliseconds)
     {
         double ticks = milliseconds * (double)Stopwatch.Frequency / 1000d;
@@ -1741,6 +1785,14 @@ internal sealed class KeyboardHook : IDisposable
         uint wMsgFilterMin,
         uint wMsgFilterMax,
         uint wRemoveMsg);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint MsgWaitForMultipleObjectsEx(
+        uint count,
+        IntPtr handles,
+        uint milliseconds,
+        uint wakeMask,
+        uint flags);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern int GetMessage(
