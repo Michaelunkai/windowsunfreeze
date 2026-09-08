@@ -18,6 +18,8 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private const int FirstHotkeyId = 0x5B00;
     private const uint HealthTimerId = 0x5BFF;
     private const int HealthTimerIntervalMs = 5_000;
+    private const int EmergencyPollIntervalMs = 50;
+    private const int RegistrationCheckIntervalMs = 1_000;
     private const int ForcedRenewalIntervalMs = 30_000;
     private const uint WAIT_TIMEOUT = 0x00000102;
     private const uint WAIT_FAILED = 0xFFFFFFFF;
@@ -31,12 +33,16 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private readonly ManualResetEventSlim _ready = new(false);
     private readonly ManualResetEventSlim _stopped = new(false);
     private readonly Thread _thread;
+    private RecoveryHotkeyBinding[] _polledBindings = Array.Empty<RecoveryHotkeyBinding>();
+    private bool[] _polledDown = Array.Empty<bool>();
+    private bool _pollPrimed;
     private Config _config;
     private Config? _pendingConfig;
     private long _lastConfigProbeTick;
     private long _lastConfigWriteTicks;
     private long _lastConfigLength = -1;
     private long _lastRegistrationTick;
+    private long _lastRegistrationCheckTick;
     private int _disposed;
     private int _threadId;
 
@@ -84,8 +90,13 @@ internal sealed class RescueHotkeyMonitor : IDisposable
             {
                 try
                 {
+                    // RegisterHotKey is the preferred helper route, but a
+                    // read-only state poll keeps an independent capture path
+                    // alive when registration is rejected or another process
+                    // owns the chord. The helper is separate from both LL hooks.
+                    PollAlwaysHotkeys();
                     uint waitResult = MsgWaitForMultipleObjectsEx(
-                        0, IntPtr.Zero, (uint)HealthTimerIntervalMs, QS_ALLINPUT,
+                        0, IntPtr.Zero, (uint)EmergencyPollIntervalMs, QS_ALLINPUT,
                         MWMO_INPUTAVAILABLE);
                     if (waitResult == WAIT_TIMEOUT)
                     {
@@ -257,8 +268,12 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private void RegisterAlwaysHotkeys()
     {
         Config config = Volatile.Read(ref _config);
+        RecoveryHotkeyBinding[] bindings = config.GetAlwaysFallbackHotkeys().ToArray();
+        Volatile.Write(ref _polledBindings, bindings);
+        _polledDown = new bool[bindings.Length];
+        _pollPrimed = false;
         int id = FirstHotkeyId;
-        foreach (RecoveryHotkeyBinding binding in config.GetAlwaysFallbackHotkeys())
+        foreach (RecoveryHotkeyBinding binding in bindings)
         {
             uint modifiers = GetNativeModifiers(binding.Chord);
             bool registered = false;
@@ -289,13 +304,66 @@ internal sealed class RescueHotkeyMonitor : IDisposable
         Volatile.Write(ref _lastRegistrationTick, Environment.TickCount64);
     }
 
+    /// <summary>
+    /// Last-resort read-only capture for always-on chords. This never injects,
+    /// suppresses, or modifies input; it only observes current key state and
+    /// emits one request on a debounced rising edge. The first sample establishes
+    /// a baseline so starting the helper while a chord is already held does not
+    /// cause a false recovery.
+    /// </summary>
+    private void PollAlwaysHotkeys()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        RecoveryHotkeyBinding[] bindings = Volatile.Read(ref _polledBindings);
+        if (bindings.Length == 0 || _polledDown.Length != bindings.Length) return;
+
+        bool alt = IsPollKeyDown(Native.VK_MENU) || IsPollKeyDown(0xA4) || IsPollKeyDown(0xA5);
+        bool ctrl = IsPollKeyDown(Native.VK_CONTROL) || IsPollKeyDown(0xA2) || IsPollKeyDown(0xA3);
+        bool shift = IsPollKeyDown(Native.VK_SHIFT) || IsPollKeyDown(0xA0) || IsPollKeyDown(0xA1);
+        bool win = IsPollKeyDown(0x5B) || IsPollKeyDown(0x5C);
+        bool rightAlt = IsPollKeyDown(0xA5);
+
+        for (int i = 0; i < bindings.Length; i++)
+        {
+            RecoveryHotkeyChord chord = bindings[i].Chord;
+            bool chordDown = IsPollKeyDown(chord.Vk) &&
+                              alt == chord.Alt &&
+                              ctrl == chord.Ctrl &&
+                              shift == chord.Shift &&
+                              win == chord.Win &&
+                              !(rightAlt && chord.Alt && chord.Ctrl);
+            if (!_pollPrimed)
+            {
+                _polledDown[i] = chordDown;
+                continue;
+            }
+
+            if (chordDown == _polledDown[i]) continue;
+            _polledDown[i] = chordDown;
+            if (!chordDown) continue;
+
+            try { _onHotkey(bindings[i]); }
+            catch (Exception ex) { Log.Error("Rescue key-state poll handler failed", ex); }
+        }
+
+        _pollPrimed = true;
+    }
+
+    private static bool IsPollKeyDown(int virtualKey) =>
+        (Native.GetAsyncKeyState(virtualKey) & unchecked((short)0x8000)) != 0;
+
     private void MaintainRegistrations()
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        long now = Environment.TickCount64;
+        long previousCheck = Volatile.Read(ref _lastRegistrationCheckTick);
+        if (previousCheck != 0 && now - previousCheck < RegistrationCheckIntervalMs) return;
+        Volatile.Write(ref _lastRegistrationCheckTick, now);
+
         Config config = Volatile.Read(ref _config);
         int expected = config.GetAlwaysFallbackHotkeys().Count;
         int actual = RegisteredCount;
-        long now = Environment.TickCount64;
         long previous = Volatile.Read(ref _lastRegistrationTick);
         bool missing = actual < expected;
         bool renewalDue = previous == 0 || now - previous >= ForcedRenewalIntervalMs;

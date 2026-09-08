@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.13**
+Version **1.4.14**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to

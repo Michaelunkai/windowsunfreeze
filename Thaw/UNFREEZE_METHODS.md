@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.8–1.4.13)
+## Capture-path hardening (1.4.8–1.4.14)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -458,6 +458,13 @@ single hook does not erase the user's emergency request:
 25. **Resource-safe worker creation** — recovery-worker construction, priority setup, publication, and
     thread start share one guarded boundary, so an allocation or start failure becomes a bounded
     handoff failure instead of escaping before the shortcut can publish its terminal receipt.
+26. **Independent key-state polling fallback** — the separate rescue helper observes the current state
+    of always-on emergency chords every 50 ms and emits only rising-edge requests. It remains useful
+    when both low-level hooks and `RegisterHotKey` are unavailable, never injects or suppresses input,
+    and establishes a baseline at startup so held keys do not create a false trigger.
+27. **Pre-sized hook key state** — both independent low-level hooks reserve pressed-key capacity at
+    startup, removing first-use collection growth from the callback path while Windows is waiting for
+    its hook decision.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

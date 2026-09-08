@@ -123,8 +123,10 @@ internal sealed class KeyboardHook : IDisposable
     // the registered-hotkey message path. Fixed atomic slots keep config reloads
     // and simultaneous callbacks from ever waiting on a managed collection lock.
     private readonly DebounceSlot[] _debounceSlots = CreateDebounceSlots();
-    private readonly HashSet<uint> _downKeys = new();
-    private readonly HashSet<uint> _rescueDownKeys = new();
+    // Keep the first emergency chord free of HashSet growth allocations while
+    // Windows is waiting for the low-level hook decision.
+    private readonly HashSet<uint> _downKeys = new(capacity: 64);
+    private readonly HashSet<uint> _rescueDownKeys = new(capacity: 64);
     private readonly DispatchSlot[] _dispatchSlots = CreateDispatchSlots();
     private readonly Queue<DispatchSlot> _dispatchQueue = new(DISPATCH_SLOT_COUNT);
     private readonly AutoResetEvent _dispatchWake = new(false);
