@@ -372,10 +372,8 @@ internal sealed class AppContext : ApplicationContext
 
     private void OnRecoveryHotkeyRequested(object? sender, RecoveryHotkeyEventArgs e)
     {
-        // This is intentionally before the asynchronous engine trigger. It gives the
-        // user a visible acknowledgement even when the recovery worker is busy; it is
-        // not a claim that Windows has accepted any recovery operation.
-        ShowImmediateCaptureFeedback(e.Action);
+        // Handoff comes first. UI marshaling must never delay a captured shortcut
+        // or prevent the pre-warmed recovery worker from receiving it.
         switch (e.Action)
         {
             case RecoveryHotkeyAction.Panic:
@@ -391,6 +389,10 @@ internal sealed class AppContext : ApplicationContext
                 RequestUnfreeze(TriggerReason.Hotkey);
                 break;
         }
+
+        // This is only a capture acknowledgement, not proof that Windows accepted
+        // every recovery operation. It is posted after the engine handoff.
+        ShowImmediateCaptureFeedback(e.Action);
     }
 
     private void ShowImmediateCaptureFeedback(RecoveryHotkeyAction action)

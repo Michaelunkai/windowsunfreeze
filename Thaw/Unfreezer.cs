@@ -367,8 +367,13 @@ internal sealed class Unfreezer : IDisposable
     /// </summary>
     private void Run(TriggerReason reason)
     {
-        try { _watchdog.CaptureTelemetryBefore(reason.ToString()); }
-        catch (Exception ex) { Log.Debug("Pre-recovery telemetry capture unavailable: " + ex.Message); }
+        bool forceAll = IsForceAll(reason);
+        var deferredPreDispatchNotes = new List<string>(4);
+        if (!forceAll)
+        {
+            try { _watchdog.CaptureTelemetryBefore(reason.ToString()); }
+            catch (Exception ex) { deferredPreDispatchNotes.Add("Pre-recovery telemetry capture unavailable: " + ex.Message); }
+        }
         var sw = Stopwatch.StartNew();
         long deadline = Environment.TickCount64 + RecoveryBudgetMs;
         var journal = new RollbackJournal();
@@ -419,7 +424,7 @@ internal sealed class Unfreezer : IDisposable
                     });
                 }
             }
-            catch (Exception ex) { Log.Debug("Own process priority boost unavailable: " + ex.Message); }
+            catch (Exception ex) { deferredPreDispatchNotes.Add("Own process priority boost unavailable: " + ex.Message); }
 
             try
             {
@@ -436,13 +441,24 @@ internal sealed class Unfreezer : IDisposable
                     catch { return false; }
                 });
             }
-            catch (Exception ex) { Log.Debug("Managed worker priority unavailable: " + ex.Message); }
+            catch (Exception ex) { deferredPreDispatchNotes.Add("Managed worker priority unavailable: " + ex.Message); }
 
-            Native.MEMORYSTATUSEX memoryBefore = Native.GetMemoryStatus();
+            Native.MEMORYSTATUSEX memoryBefore = default;
+            bool memorySampleRead = false;
+            try
+            {
+                memoryBefore = Native.GetMemoryStatus();
+                memorySampleRead = true;
+            }
+            catch (Exception ex)
+            {
+                deferredPreDispatchNotes.Add("Pre-recovery memory sample unavailable: " + ex.Message);
+            }
             availableBefore = memoryBefore.ullAvailPhys;
-            bool forceAll = IsForceAll(reason);
             bool deferExpensiveProbes = DefersExpensivePreDispatchProbes(reason);
-            uint foregroundPid = Native.GetForegroundPid();
+            uint foregroundPid = 0;
+            try { foregroundPid = Native.GetForegroundPid(); }
+            catch (Exception ex) { deferredPreDispatchNotes.Add("Foreground PID probe unavailable: " + ex.Message); }
             counters.ForegroundPid = foregroundPid;
             counters.ForegroundName = deferExpensiveProbes ? "deferred" : TryGetProcessName(foregroundPid);
             // A force-all shortcut deliberately does not wait for the expensive
@@ -450,11 +466,24 @@ internal sealed class Unfreezer : IDisposable
             // already includes the display/shell paths, and the probes can be
             // the very components that are stalled. Cause-directed requests keep
             // the probes for their safer selection gates.
-            counters.ForegroundHung = !deferExpensiveProbes && IsForegroundHung(foregroundPid);
-            counters.DwmHung = !deferExpensiveProbes && IsDwmHung();
-            counters.ExplorerHung = !deferExpensiveProbes && IsExplorerHung();
-            bool measuredMemoryPressure = IsMemoryPressure(memoryBefore, out string memoryReason);
-            bool memoryPressure = measuredMemoryPressure || forceAll;
+            counters.ForegroundHung = !deferExpensiveProbes && IsForegroundHung(foregroundPid, logFailures: false);
+            counters.DwmHung = !deferExpensiveProbes && TryGetDwmHungForSelection();
+            counters.ExplorerHung = !deferExpensiveProbes && IsExplorerHung(logFailures: false);
+            bool measuredMemoryPressure;
+            string memoryReason;
+            try
+            {
+                measuredMemoryPressure = IsMemoryPressure(memoryBefore, out memoryReason);
+            }
+            catch (Exception ex)
+            {
+                measuredMemoryPressure = false;
+                memoryReason = "memory-pressure probe unavailable";
+                deferredPreDispatchNotes.Add("Memory-pressure probe unavailable: " + ex.Message);
+            }
+            bool memoryPressure = measuredMemoryPressure || _watchdog.MemoryPressure || forceAll;
+            if (!memorySampleRead && !forceAll)
+                memoryReason = "memory-sample-unavailable; using watchdog evidence";
             if (forceAll)
                 memoryReason = $"force-all(load={memoryBefore.dwMemoryLoad}%, available={memoryBefore.ullAvailPhys / (1024 * 1024)} MB)";
             counters.MemoryReason = memoryReason;
@@ -484,9 +513,16 @@ internal sealed class Unfreezer : IDisposable
             long dispatchStarted = Environment.TickCount64;
             dispatch = _coordinator.Dispatch(runId, reason, cause, forceAll, deadline, journal, actions);
             long dispatchMs = Environment.TickCount64 - dispatchStarted;
+            if (forceAll)
+            {
+                try { _watchdog.CaptureTelemetryBefore(reason.ToString()); }
+                catch (Exception ex) { deferredPreDispatchNotes.Add("Pre-recovery telemetry capture unavailable: " + ex.Message); }
+            }
             // Log only after the coordinator has signalled the pre-warmed action
             // workers. File I/O or a locked log must never precede first recovery
             // mutations on the force-all shortcut path.
+            foreach (string note in deferredPreDispatchNotes)
+                Log.Debug(note);
             Log.Info($"Unfreeze triggered ({reason})");
             Log.Info($"Recovery diagnostics: reason={reason}, cause={primaryCause}, budget={RecoveryBudgetMs} ms, " +
                      $"elevated={Native.IsElevated()}, fg={foregroundPid}/{counters.ForegroundName}, " +
@@ -1747,7 +1783,7 @@ internal sealed class Unfreezer : IDisposable
         catch { return "exited-or-denied"; }
     }
 
-    private static bool IsForegroundHung(uint foregroundPid)
+    private static bool IsForegroundHung(uint foregroundPid, bool logFailures = true)
     {
         try
         {
@@ -1758,7 +1794,7 @@ internal sealed class Unfreezer : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Debug("Foreground responsiveness probe failed: " + ex.Message);
+            if (logFailures) Log.Debug("Foreground responsiveness probe failed: " + ex.Message);
             return false;
         }
     }
@@ -1776,10 +1812,16 @@ internal sealed class Unfreezer : IDisposable
         catch { return false; }
     }
 
-    private static bool IsExplorerHung()
+    private static bool IsExplorerHung(bool logFailures = true)
     {
         var explorerPids = new HashSet<uint>();
-        int activeSession = unchecked((int)Native.WTSGetActiveConsoleSessionId());
+        int activeSession;
+        try { activeSession = unchecked((int)Native.WTSGetActiveConsoleSessionId()); }
+        catch (Exception ex)
+        {
+            if (logFailures) Log.Debug("Explorer session probe unavailable: " + ex.Message);
+            return false;
+        }
         try
         {
             foreach (var process in Process.GetProcessesByName("explorer"))
@@ -1795,7 +1837,7 @@ internal sealed class Unfreezer : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Debug("Explorer responsiveness probe unavailable: " + ex.Message);
+            if (logFailures) Log.Debug("Explorer responsiveness probe unavailable: " + ex.Message);
             return false;
         }
 
@@ -1816,9 +1858,10 @@ internal sealed class Unfreezer : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Debug("Explorer window probe failed: " + ex.Message);
+            if (logFailures) Log.Debug("Explorer window probe failed: " + ex.Message);
         }
-        Log.Debug($"Explorer check: processes={explorerPids.Count}, visible={foundVisible}, hung={hung}");
+        if (logFailures)
+            Log.Debug($"Explorer check: processes={explorerPids.Count}, visible={foundVisible}, hung={hung}");
         return hung;
     }
 
@@ -1857,7 +1900,7 @@ internal sealed class Unfreezer : IDisposable
     /// window classes (pre- and post-Win11), then falls back to enumerating top-level
     /// windows owned by the dwm process.
     /// </summary>
-    private static bool IsDwmHung()
+    private static bool IsDwmHung(bool logDetails = true)
     {
         if (!TryGetValidatedDwmProcess(out Process? compositor) || compositor is null)
             return false;
@@ -1872,7 +1915,8 @@ internal sealed class Unfreezer : IDisposable
             Native.GetWindowThreadProcessId(wnd, out uint ownerPid);
             bool ownedByDwm = ownerPid == dwmPid;
             bool directHung = ownedByDwm && Native.IsHungAppWindow(wnd);
-            Log.Debug($"DWM check: hwnd=0x{wnd.ToInt64():X}, pid={ownerPid}, owned={ownedByDwm}, hung={directHung}");
+            if (logDetails)
+                Log.Debug($"DWM check: hwnd=0x{wnd.ToInt64():X}, pid={ownerPid}, owned={ownedByDwm}, hung={directHung}");
             return directHung;
         }
 
@@ -1889,8 +1933,14 @@ internal sealed class Unfreezer : IDisposable
             }
             return true;
         }, IntPtr.Zero);
-        Log.Debug($"DWM check (enum): found={found} hung={hung}");
+        if (logDetails) Log.Debug($"DWM check (enum): found={found} hung={hung}");
         return found && hung;
+    }
+
+    private static bool TryGetDwmHungForSelection()
+    {
+        try { return IsDwmHung(logDetails: false); }
+        catch { return false; }
     }
 
     /// <summary>

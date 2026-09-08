@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.6**
+Version **1.4.7**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -123,8 +123,9 @@ application memory or process dumps.
   are intentionally documented separately. The Alt+F4 force-all path decides its profile before
   expensive foreground/DWM/Explorer probes and queues the recovery graph first; synchronous
   trigger/diagnostic logging is written only after that handoff, as is the tray acceptance log;
-  optional sound and UI feedback are posted asynchronously, and evidence probes run
-  independently afterward within their own deadlines.
+  optional sound and UI feedback are posted asynchronously after handoff, and individual
+  pre-dispatch probe failures are isolated so they cannot cancel recovery. Evidence probes
+  run independently within their own deadlines.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|

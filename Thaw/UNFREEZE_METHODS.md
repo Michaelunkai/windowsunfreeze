@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.6)
+## Capture-path hardening (1.4.7)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -394,9 +394,13 @@ single hook does not erase the user's emergency request:
    DWM, Explorer, or foreground-name probes that may themselves be stalled. It queues the
    complete recovery graph first; synchronous engine and tray acceptance/diagnostic logging
    is also deferred until after that handoff. Optional sound/UI feedback is posted
-   asynchronously, and evidence collection runs in independently bounded action workers, so
-   a diagnostic, log-volume, audio, or UI delay cannot postpone the first recovery mutations.
-9. **Capture telemetry** — support diagnostics expose primary/emergency installation,
+   asynchronously after handoff, and each pre-dispatch native probe is failure-isolated, so a
+   diagnostic, log-volume, audio, or UI delay cannot postpone or cancel the first recovery
+   mutations.
+9. **Probe-failure containment** — unavailable memory, foreground, DWM, Explorer, or
+   telemetry probes fall back to bounded defaults/watchdog evidence and still dispatch the
+   configured recovery graph. Probe-detail logging is deferred until workers are signalled.
+10. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.
 
