@@ -465,6 +465,7 @@ internal sealed class RecoveryCoordinator : IDisposable
         var dispatch = new RecoveryDispatch(runId, Environment.TickCount64, runDeadlineTick,
             Math.Min(actions.Count, MaxActionWorkers));
         int queued = 0;
+        bool activated = false;
         try
         {
             lock (_gate)
@@ -499,6 +500,7 @@ internal sealed class RecoveryCoordinator : IDisposable
                     _queue.Enqueue(item);
                 }
                 dispatch.Activate(queued);
+                activated = true;
                 _workAvailable.Set();
             }
 
@@ -507,7 +509,39 @@ internal sealed class RecoveryCoordinator : IDisposable
         }
         catch
         {
-            Interlocked.Exchange(ref _activeDispatch, 0);
+            // Close the batch before releasing the coordinator reservation. If
+            // setup failed after queueing an item, workers must observe a
+            // closed dispatch and complete it as skipped rather than beginning
+            // an untracked native mutation. Activate a partially filled batch
+            // so its drain accounting remains valid even when the failure was
+            // raised before the normal activation point.
+            try
+            {
+                // Take the same queue gate used by workers before closing. This
+                // prevents an item that is still queued from being dequeued in
+                // the small window between a setup exception and cleanup.
+                lock (_gate)
+                {
+                    if (!activated)
+                    {
+                        try { dispatch.Activate(queued); }
+                        catch (Exception ex) { Log.Debug("Partial recovery dispatch activation failed: " + ex.Message); }
+                    }
+                    dispatch.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Debug("Aborted recovery dispatch close failed: " + ex.Message);
+                dispatch.Close();
+            }
+            try { _workAvailable.Set(); } catch { }
+            try { FinishDispatch(dispatch); }
+            catch (Exception ex)
+            {
+                Log.Error("Failed to finish aborted recovery dispatch", ex);
+                Interlocked.Exchange(ref _activeDispatch, 0);
+            }
             throw;
         }
     }

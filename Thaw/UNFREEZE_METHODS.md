@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.8–1.4.10)
+## Capture-path hardening (1.4.8–1.4.11)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -439,6 +439,10 @@ single hook does not erase the user's emergency request:
    checks the parent's exit code. A nonzero crash exit escalates the captured request directly to
    the bounded headless force-all fallback; a clean exit remains non-escalating to avoid duplicate
    work.
+21. **Aborted-dispatch fencing** — if action setup fails after filling any preallocated slots, the
+   coordinator closes the partial batch while holding the queue gate, wakes the workers, and keeps
+   the active-run reservation until any already-running action drains. Queued actions therefore
+   finish as skipped instead of becoming untracked recovery mutations.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

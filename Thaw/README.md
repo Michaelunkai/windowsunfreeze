@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.10**
+Version **1.4.11**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -139,7 +139,9 @@ application memory or process dumps.
   request, it also publishes a terminal worker-boundary result so the tray and rescue helper do
   not wait for a completion event that can never arrive. Recovery worker prewarming tolerates a
   partial startup under resource pressure and reports an explicit terminal failure only when no
-  worker is available at all.
+  worker is available at all. If dispatch setup itself aborts after filling any slots, the batch
+  is closed under the queue gate and the coordinator keeps its active-run reservation until
+  already-running work drains.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|
