@@ -138,9 +138,9 @@ internal sealed class KeyboardHook : IDisposable
     private readonly AutoResetEvent _fallbackDispatchWake = new(false);
     private Thread? _hookThread;
     private Thread? _rescueThread;
-    private readonly Thread _dispatchThread;
-    private readonly Thread _fallbackDispatchThread;
-    private readonly Thread _hookSupervisorThread;
+    private Thread? _dispatchThread;
+    private Thread? _fallbackDispatchThread;
+    private Thread? _hookSupervisorThread;
 
     private RecoveryHotkeyBinding[] _bindings = Array.Empty<RecoveryHotkeyBinding>();
     private long _debounceTicks;
@@ -256,25 +256,13 @@ internal sealed class KeyboardHook : IDisposable
         _winDown = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 ||
                    (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
 
-        _dispatchThread = new Thread(DispatchThreadMain)
-        {
-            IsBackground = true,
-            Name = "Thaw hotkey dispatch"
-        };
-        SetHighPriority(_dispatchThread);
-        _dispatchThread.Start();
+        StartDispatchThreadIfNeeded(fallback: false, reason: "initial");
 
         // Keep a second, independent delivery worker pre-warmed. It is only
         // used when the normal ring and its reserved slot are both occupied,
         // so a burst or a transient dispatch-worker fault cannot turn a
         // captured chord into a silent no-op.
-        _fallbackDispatchThread = new Thread(FallbackDispatchThreadMain)
-        {
-            IsBackground = true,
-            Name = "Thaw emergency hotkey dispatch"
-        };
-        SetHighPriority(_fallbackDispatchThread);
-        _fallbackDispatchThread.Start();
+        StartDispatchThreadIfNeeded(fallback: true, reason: "initial");
 
         StartHookThreadIfNeeded(rescue: false, reason: "initial");
 
@@ -286,13 +274,22 @@ internal sealed class KeyboardHook : IDisposable
         if (!_rescueReady.Wait(3000))
             Log.Error("Emergency keyboard hook thread did not report readiness within 3 s");
 
-        _hookSupervisorThread = new Thread(HookSupervisorThreadMain)
+        try
         {
-            IsBackground = true,
-            Name = "Thaw keyboard hook supervisor"
-        };
-        SetHighPriority(_hookSupervisorThread);
-        _hookSupervisorThread.Start();
+            Thread supervisor = new Thread(HookSupervisorThreadMain)
+            {
+                IsBackground = true,
+                Name = "Thaw keyboard hook supervisor"
+            };
+            _hookSupervisorThread = supervisor;
+            SetHighPriority(supervisor);
+            supervisor.Start();
+        }
+        catch (Exception ex)
+        {
+            _hookSupervisorThread = null;
+            Log.Error("Keyboard hook supervisor start failed; hook heartbeats will supervise dispatch", ex);
+        }
 
         Log.Info($"Keyboard hook paths ready: primary={(IsInstalled ? "installed" : "NO hook")}, " +
                  $"emergency={(IsEmergencyInstalled ? "installed" : "NO hook")}, " +
@@ -405,6 +402,16 @@ internal sealed class KeyboardHook : IDisposable
                 {
                     Log.Error("Emergency keyboard hook supervision failed; retrying", ex);
                 }
+                try { EnsureDispatchPath(fallback: false); }
+                catch (Exception ex)
+                {
+                    Log.Error("Primary keyboard dispatch supervision failed; retrying", ex);
+                }
+                try { EnsureDispatchPath(fallback: true); }
+                catch (Exception ex)
+                {
+                    Log.Error("Emergency keyboard dispatch supervision failed; retrying", ex);
+                }
             }
         }
         catch (Exception ex)
@@ -413,7 +420,66 @@ internal sealed class KeyboardHook : IDisposable
         }
         finally
         {
-            _hookSupervisorStopped.Set();
+            try { _hookSupervisorStopped.Set(); } catch { }
+        }
+    }
+
+    private void EnsureDispatchPath(bool fallback)
+    {
+        Thread? worker = fallback
+            ? Volatile.Read(ref _fallbackDispatchThread)
+            : Volatile.Read(ref _dispatchThread);
+        if (worker?.IsAlive == true) return;
+
+        StartDispatchThreadIfNeeded(fallback, "supervisor");
+    }
+
+    private void StartDispatchThreadIfNeeded(bool fallback, string reason)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        lock (_threadGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            Thread? existing = fallback
+                ? Volatile.Read(ref _fallbackDispatchThread)
+                : Volatile.Read(ref _dispatchThread);
+            if (existing?.IsAlive == true) return;
+
+            Thread? replacement = null;
+            try
+            {
+                replacement = new Thread(fallback ? FallbackDispatchThreadMain : DispatchThreadMain)
+                {
+                    IsBackground = true,
+                    Name = fallback ? "Thaw emergency hotkey dispatch" : "Thaw hotkey dispatch",
+                };
+                SetHighPriority(replacement);
+                if (fallback)
+                    Volatile.Write(ref _fallbackDispatchThread, replacement);
+                else
+                    Volatile.Write(ref _dispatchThread, replacement);
+
+                replacement.Start();
+                if (!string.Equals(reason, "initial", StringComparison.OrdinalIgnoreCase))
+                    Log.Info((fallback ? "Emergency" : "Primary") +
+                             " hotkey dispatch worker restarted (" + reason + ")");
+            }
+            catch (Exception ex)
+            {
+                if (replacement is not null && fallback)
+                {
+                    if (ReferenceEquals(Volatile.Read(ref _fallbackDispatchThread), replacement))
+                        Volatile.Write(ref _fallbackDispatchThread, null);
+                }
+                else if (replacement is not null && ReferenceEquals(Volatile.Read(ref _dispatchThread), replacement))
+                {
+                    Volatile.Write(ref _dispatchThread, null);
+                }
+                Log.Error((fallback ? "Emergency" : "Primary") +
+                          " hotkey dispatch worker start failed", ex);
+            }
         }
     }
 
@@ -464,17 +530,18 @@ internal sealed class KeyboardHook : IDisposable
             if (existing?.IsAlive == true) return;
 
             ThreadStart entry = rescue ? RescueHookThreadMain : HookThreadMain;
-            var replacement = new Thread(entry)
-            {
-                IsBackground = true,
-                Name = rescue ? "Thaw emergency keyboard hook" : "Thaw low-level keyboard hook",
-            };
-            SetHighPriority(replacement);
-            if (rescue) _rescueThread = replacement;
-            else _hookThread = replacement;
-
+            Thread? replacement = null;
             try
             {
+                replacement = new Thread(entry)
+                {
+                    IsBackground = true,
+                    Name = rescue ? "Thaw emergency keyboard hook" : "Thaw low-level keyboard hook",
+                };
+                SetHighPriority(replacement);
+                if (rescue) _rescueThread = replacement;
+                else _hookThread = replacement;
+
                 replacement.Start();
                 if (!string.Equals(reason, "initial", StringComparison.OrdinalIgnoreCase))
                     Log.Info((rescue ? "Emergency" : "Primary") +
@@ -484,12 +551,12 @@ internal sealed class KeyboardHook : IDisposable
             {
                 if (rescue)
                 {
-                    if (ReferenceEquals(_rescueThread, replacement)) _rescueThread = null;
+                    if (replacement is not null && ReferenceEquals(_rescueThread, replacement)) _rescueThread = null;
                     _rescueReady.Set();
                 }
                 else
                 {
-                    if (ReferenceEquals(_hookThread, replacement)) _hookThread = null;
+                    if (replacement is not null && ReferenceEquals(_hookThread, replacement)) _hookThread = null;
                     _hookReady.Set();
                 }
                 Log.Error((rescue ? "Emergency" : "Primary") +
@@ -787,6 +854,9 @@ internal sealed class KeyboardHook : IDisposable
         if (!IsEmergencyInstalled || _rescueHandle == IntPtr.Zero ||
             installAge >= ToStopwatchTicks(RESCUE_HOOK_RENEWAL_MS))
             InstallRescueHook("heartbeat");
+
+        try { EnsureDispatchPath(fallback: true); }
+        catch (Exception ex) { Log.Error("Emergency dispatch heartbeat supervision failed", ex); }
     }
 
     private IntPtr RescueHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1048,6 +1118,8 @@ internal sealed class KeyboardHook : IDisposable
             InstallHook("heartbeat");
 
         MaintainFallbackHotkeys(now);
+        try { EnsureDispatchPath(fallback: false); }
+        catch (Exception ex) { Log.Error("Primary dispatch heartbeat supervision failed", ex); }
     }
 
     private void MaintainFallbackHotkeys(long now)
@@ -1621,13 +1693,14 @@ internal sealed class KeyboardHook : IDisposable
         // Stop the supervisor first. Once it has observed disposal it must not
         // create a replacement while the owner is tearing the hook threads down.
         try { _hookSupervisorStop.Set(); } catch { }
-        bool supervisorOwn = ReferenceEquals(Thread.CurrentThread, _hookSupervisorThread);
-        if (!supervisorOwn)
+        Thread? supervisorThread = Volatile.Read(ref _hookSupervisorThread);
+        bool supervisorOwn = ReferenceEquals(Thread.CurrentThread, supervisorThread);
+        if (!supervisorOwn && supervisorThread is not null)
         {
-            try { _hookSupervisorThread.Join(2000); } catch { }
+            try { supervisorThread.Join(2000); } catch { }
             try { _hookSupervisorStopped.Wait(2000); } catch { }
         }
-        bool supervisorStopped = supervisorOwn ? false : !_hookSupervisorThread.IsAlive;
+        bool supervisorStopped = supervisorOwn ? false : supervisorThread is null || !supervisorThread.IsAlive;
 
         Thread? hookThread = Volatile.Read(ref _hookThread);
         bool hookThreadOwn = ReferenceEquals(Thread.CurrentThread, hookThread);
@@ -1662,24 +1735,27 @@ internal sealed class KeyboardHook : IDisposable
         // Wake and join the pre-warmed dispatch worker. No callback can enqueue
         // after _disposed is published, and any queued slots are cleared there.
         try { _dispatchWake.Set(); } catch { }
-        if (Thread.CurrentThread != _dispatchThread)
+        Thread? dispatchThread = Volatile.Read(ref _dispatchThread);
+        if (dispatchThread is not null && Thread.CurrentThread != dispatchThread)
         {
-            try { _dispatchThread.Join(2000); } catch { }
+            try { dispatchThread.Join(2000); } catch { }
         }
 
-        bool dispatchStopped = Thread.CurrentThread == _dispatchThread || !_dispatchThread.IsAlive;
+        bool dispatchStopped = dispatchThread is null || Thread.CurrentThread == dispatchThread || !dispatchThread.IsAlive;
 
         // Wake and join the independent last-resort delivery worker before
         // disposing its wait handle. It owns a separate slot and event from
         // the normal dispatch path.
         try { _fallbackDispatchWake.Set(); } catch { }
-        if (Thread.CurrentThread != _fallbackDispatchThread)
+        Thread? fallbackDispatchThread = Volatile.Read(ref _fallbackDispatchThread);
+        if (fallbackDispatchThread is not null && Thread.CurrentThread != fallbackDispatchThread)
         {
-            try { _fallbackDispatchThread.Join(2000); } catch { }
+            try { fallbackDispatchThread.Join(2000); } catch { }
             try { _fallbackDispatchStopped.Wait(2000); } catch { }
         }
-        bool fallbackDispatchStopped = Thread.CurrentThread == _fallbackDispatchThread ||
-                                       !_fallbackDispatchThread.IsAlive;
+        bool fallbackDispatchStopped = fallbackDispatchThread is null ||
+                                       Thread.CurrentThread == fallbackDispatchThread ||
+                                       !fallbackDispatchThread.IsAlive;
 
         if (hookThreadOwn)
             RemoveHook();

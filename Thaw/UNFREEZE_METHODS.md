@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.8–1.4.9)
+## Capture-path hardening (1.4.8–1.4.10)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -424,6 +424,21 @@ single hook does not erase the user's emergency request:
    trigger failures release the tray retry fence immediately, and optional UI posts are
    guarded. A closed dispatch also completes queued actions as skipped instead of starting a
    late native mutation.
+17. **Worker-boundary completion** — the pre-warmed recovery handoff tracks the request it has
+   claimed and publishes an explicit unverified completion if the worker exits before `Run()`
+   can report one. Stranded pending requests are converted into the same terminal receipt, so
+   the tray retry guard and rescue helper cannot wait for an impossible acknowledgement.
+18. **Dispatch-worker supervision** — the independent hook supervisor and both hook heartbeats
+   watch the normal and emergency delivery workers. If one exits, its queue/slot remains
+   available for a bounded restart instead of leaving already-captured shortcuts undelivered.
+19. **Partial prewarm tolerance** — recovery worker creation records individual startup failures
+   and continues with the workers that did start. If resource pressure prevents every worker from
+   starting, the trigger becomes a terminal unverified result instead of crashing or hanging the
+   tray process.
+20. **Crash-time rescue escalation** — after a missing acknowledgement, the Thaw-only helper
+   checks the parent's exit code. A nonzero crash exit escalates the captured request directly to
+   the bounded headless force-all fallback; a clean exit remains non-escalating to avoid duplicate
+   work.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

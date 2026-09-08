@@ -410,17 +410,30 @@ internal sealed class RecoveryCoordinator : IDisposable
     internal RecoveryCoordinator(Action<RecoveryProgressReceipt>? progress = null)
     {
         _progress = progress;
-        _workers = Enumerable.Range(0, MaxActionWorkers).Select(i =>
+        var workers = new List<Thread>(MaxActionWorkers);
+        for (int i = 0; i < MaxActionWorkers; i++)
         {
-            var thread = new Thread(WorkerLoop)
+            try
             {
-                IsBackground = true,
-                Name = "Thaw.RecoveryWorker." + i,
-            };
-            TrySetPriority(thread, ThreadPriority.Highest, thread.Name);
-            thread.Start();
-            return thread;
-        }).ToArray();
+                Thread thread = new(WorkerLoop)
+                {
+                    IsBackground = true,
+                    Name = "Thaw.RecoveryWorker." + i,
+                };
+                TrySetPriority(thread, ThreadPriority.Highest, thread.Name);
+                thread.Start();
+                workers.Add(thread);
+            }
+            catch (Exception ex)
+            {
+                // A resource-starved machine must not crash the tray merely
+                // because one pre-warmed slot could not start. Other workers
+                // can drain the bounded queue; a zero-worker coordinator is
+                // rejected explicitly by Dispatch() below.
+                Log.Error("Unable to start pre-warmed recovery worker " + i, ex);
+            }
+        }
+        _workers = workers.ToArray();
     }
 
     internal static IReadOnlyList<string> SafeReversibleActions { get; } = new[]
@@ -444,6 +457,8 @@ internal sealed class RecoveryCoordinator : IDisposable
         IReadOnlyList<RecoveryActionSpec> actions)
     {
         if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(RecoveryCoordinator));
+        if (_workers.Length == 0)
+            throw new InvalidOperationException("No pre-warmed recovery worker is available");
         if (Interlocked.CompareExchange(ref _activeDispatch, 1, 0) != 0)
             throw new InvalidOperationException("a recovery dispatch is already active");
 

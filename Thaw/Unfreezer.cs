@@ -305,6 +305,8 @@ internal sealed class Unfreezer : IDisposable
 
     private void RecoveryRequestWorkerMain()
     {
+        int inFlightEncodedReason = 0;
+        bool inFlightFailurePublished = false;
         try
         {
             while (Volatile.Read(ref _disposed) == 0)
@@ -329,6 +331,8 @@ internal sealed class Unfreezer : IDisposable
                 int encodedReason = Interlocked.Exchange(ref _pendingReason, 0);
                 if (encodedReason <= 0) continue;
 
+                inFlightEncodedReason = encodedReason;
+                inFlightFailurePublished = false;
                 try
                 {
                     Run((TriggerReason)(encodedReason - 1));
@@ -338,24 +342,64 @@ internal sealed class Unfreezer : IDisposable
                     // Run has its own final boundary; this guard protects the
                     // pre-warmed handoff if a future change escapes that boundary.
                     Log.Error("Recovery request worker escaped the run boundary", ex);
+                    inFlightFailurePublished = true;
+                    PublishTerminalWorkerFailure(encodedReason, "run-boundary", ex);
                     Interlocked.Exchange(ref _active, 0);
                 }
+                finally { inFlightEncodedReason = 0; }
             }
         }
         catch (Exception ex)
         {
             Log.Error("Recovery request worker failed", ex);
+            if (inFlightEncodedReason > 0 && !inFlightFailurePublished)
+            {
+                inFlightFailurePublished = true;
+                PublishTerminalWorkerFailure(inFlightEncodedReason, "worker-boundary", ex);
+                Interlocked.Exchange(ref _active, 0);
+            }
         }
         finally
         {
             if (Volatile.Read(ref _disposed) == 0)
             {
-                Interlocked.Exchange(ref _pendingReason, 0);
-                Interlocked.Exchange(ref _active, 0);
+                int strandedEncodedReason = Interlocked.Exchange(ref _pendingReason, 0);
+                if (strandedEncodedReason > 0)
+                {
+                    PublishTerminalWorkerFailure(
+                        strandedEncodedReason,
+                        "worker-exited-before-consume",
+                        new InvalidOperationException("The pre-warmed recovery worker exited before consuming the request."));
+                }
             }
+            Interlocked.Exchange(ref _active, 0);
             if (ReferenceEquals(Volatile.Read(ref _recoveryWorker), Thread.CurrentThread))
                 Volatile.Write(ref _recoveryWorker, null);
         }
+    }
+
+    /// <summary>
+    /// Converts a recovery handoff failure into the same terminal completion
+    /// contract used by Run().  A request can be accepted by Trigger() before
+    /// the worker reaches Run(), so clearing only the active flag would leave
+    /// the tray guard and rescue helper waiting for an event that can never
+    /// arrive.  The receipt is deliberately unverified: no recovery mutation
+    /// was proven to run.
+    /// </summary>
+    private void PublishTerminalWorkerFailure(int encodedReason, string boundary, Exception exception)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || encodedReason <= 0) return;
+
+        TriggerReason reason = (TriggerReason)(encodedReason - 1);
+        var failure = new UnfreezeStats(0, 0, 0, 0, reason, false, false, false)
+        {
+            OverallOutcome = RecoveryOutcome.Unverified,
+            PrimaryCause = "recovery-worker-failure",
+            Diagnostics = $"recovery-worker-boundary={boundary},exception={exception.GetType().Name}",
+        };
+
+        try { Completed?.Invoke(failure); }
+        catch (Exception notifyEx) { Log.Error("Unable to publish recovery-worker failure result", notifyEx); }
     }
 
     /// <summary>

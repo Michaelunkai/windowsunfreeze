@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.9**
+Version **1.4.10**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -88,22 +88,24 @@ application memory or process dumps.
   second independent low-level hook, lock-free callback capture, a reserved emergency
   dispatch slot, callback/drop counters for the rare saturated path, and an independent
   supervisor that recreates a hook thread if its native message loop ever exits. The
-  dispatch workers also isolate delivery/queue exceptions and retry their loops without
-  clearing already-captured requests; the final worker is an independent pre-warmed
-  last-resort slot. Each event subscriber is isolated individually, and AltGr text input
-  is excluded from Ctrl+Alt recovery matching. Recovery requests are handed to a pre-warmed
-  high-priority worker, with bounded recreation only if that worker itself exits. A capture
-  carries the exact successfully-published rescue sequence through dispatch; failed event
-  pulses cannot acknowledge an older request. Both dispatch workers poll their queues when a
-  wake pulse fails, and the hook message loops perform bounded health ticks even if a timer
-  stops delivering messages.
+  supervisor and hook heartbeats also recreate a dispatch worker if one exits, while the
+  dispatch workers isolate delivery/queue exceptions and retry their loops without clearing
+  already-captured requests; the final worker is an independent pre-warmed last-resort slot.
+  Each event subscriber is isolated individually, and AltGr text input is excluded from
+  Ctrl+Alt recovery matching. Recovery requests are handed to a pre-warmed high-priority
+  worker, with bounded recreation only if that worker itself exits. A capture carries the
+  exact successfully-published rescue sequence through dispatch; failed event pulses cannot
+  acknowledge an older request. Both dispatch workers poll their queues when a wake pulse
+  fails, and the hook message loops perform bounded health ticks even if a timer stops
+  delivering messages.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic,
   frame-drop, and Alt+F4 (when `AltF4Mode` is `always`) chords with `RegisterHotKey`; the
   main process keeps a matching in-process fallback as well. If the main process does not
-  acknowledge a capture, the helper starts one headless bounded force-all recovery. This
-  is an emergency fallback, not a second normal recovery loop, and it never runs arbitrary
-  commands. Its registered-hotkey message loop re-registers after a recoverable
+  acknowledge a capture, the helper starts one headless bounded force-all recovery—even when
+  the main process has just crashed with a nonzero exit code. A clean parent exit is still
+  ignored. This is an emergency fallback, not a second normal recovery loop, and it never runs
+  arbitrary commands. Its registered-hotkey message loop re-registers after a recoverable
   message/queue failure, retries rejected registrations, renews them periodically, and
   refreshes its registrations after a live config change; bounded message-queue polling keeps
   those health checks alive if `SetTimer` fails. The parent helper recreates the monitor thread
@@ -133,7 +135,11 @@ application memory or process dumps.
   run independently within their own deadlines, and a wait-boundary fault still closes the
   batch while preserving the active-run fence until late workers drain. Failed runs publish a
   terminal unverified result so the tray can release its retry guard immediately, even when
-  optional UI marshaling is unavailable.
+  optional UI marshaling is unavailable. If the handoff worker itself exits after accepting a
+  request, it also publishes a terminal worker-boundary result so the tray and rescue helper do
+  not wait for a completion event that can never arrive. Recovery worker prewarming tolerates a
+  partial startup under resource pressure and reports an explicit terminal failure only when no
+  worker is available at all.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|

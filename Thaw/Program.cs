@@ -735,7 +735,22 @@ internal static class Program
 
         try
         {
-            if (parent.HasExited) return;
+            if (parent.HasExited)
+            {
+                int exitCode;
+                try { exitCode = parent.ExitCode; }
+                catch { return; }
+                if (exitCode == 0)
+                {
+                    // A cleanly closed parent cannot have a live recovery run
+                    // that needs rescue escalation. The monitor's normal
+                    // shutdown path remains responsible for clean exits.
+                    return;
+                }
+
+                Console.WriteLine("Main Thaw process exited with code " + exitCode +
+                                  "; escalating the captured rescue request immediately.");
+            }
         }
         catch { return; }
 

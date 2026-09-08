@@ -1,5 +1,5 @@
 #define AppName "Thaw"
-#define AppVersion "1.4.9"
+#define AppVersion "1.4.10"
 #define AppPublisher "Michaelunkai"
 #define AppExeName "Thaw.exe"
 
