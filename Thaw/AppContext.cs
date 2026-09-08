@@ -369,11 +369,6 @@ internal sealed class AppContext : ApplicationContext
 
     private void OnRecoveryHotkeyRequested(object? sender, RecoveryHotkeyEventArgs e)
     {
-        // The hook also acknowledges when it enters the dispatch ring. This
-        // second acknowledgement covers compatibility subscribers and gives
-        // the optional out-of-process helper a clear in-process acceptance edge.
-        _ = _hook.AcknowledgeLastCapture();
-
         // This is intentionally before the asynchronous engine trigger. It gives the
         // user a visible acknowledgement even when the recovery worker is busy; it is
         // not a claim that Windows has accepted any recovery operation.

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -87,6 +86,9 @@ internal sealed class KeyboardHook : IDisposable
     private const int RESCUE_HOOK_HEARTBEAT_INTERVAL_MS = 500;
     private const int RESCUE_HOOK_RENEWAL_MS = 15000;
     private const int DISPATCH_SLOT_COUNT = 32;
+    private const int DEBOUNCE_SLOT_COUNT = 16;
+    private const int EMERGENCY_WRITING = 3;
+    private const string DEBOUNCE_CLAIM = "\0";
 
     private const uint LLKHF_LOWER_IL_INJECTED = 0x02;
     private const uint LLKHF_INJECTED = 0x10;
@@ -102,12 +104,11 @@ internal sealed class KeyboardHook : IDisposable
     private readonly RescueBroker _rescueBroker;
     private readonly bool _ownsRescueBroker;
     private Config _config;
-    private readonly object _stateGate = new();
     private readonly object _dispatchGate = new();
     // Capture/debounce state is touched by both independent hook callbacks and
-    // the registered-hotkey message path. A ConcurrentDictionary keeps config
-    // reloads from ever blocking a WH_KEYBOARD_LL callback.
-    private readonly ConcurrentDictionary<string, long> _lastAccepted = new(StringComparer.OrdinalIgnoreCase);
+    // the registered-hotkey message path. Fixed atomic slots keep config reloads
+    // and simultaneous callbacks from ever waiting on a managed collection lock.
+    private readonly DebounceSlot[] _debounceSlots = CreateDebounceSlots();
     private readonly HashSet<uint> _downKeys = new();
     private readonly HashSet<uint> _rescueDownKeys = new();
     private readonly DispatchSlot[] _dispatchSlots = CreateDispatchSlots();
@@ -295,9 +296,9 @@ internal sealed class KeyboardHook : IDisposable
     public long CaptureCount => Interlocked.Read(ref _captureCount);
 
     /// <summary>
-    /// Lets the optional out-of-process helper know that the main dispatcher
-    /// accepted the capture. The acknowledgement is best effort and never gates
-    /// the in-process recovery request.
+    /// Lets an integration explicitly acknowledge the latest delivered capture.
+    /// The normal dispatch worker acknowledges automatically after delivery; this
+    /// compatibility method is sequence-gated so it cannot create duplicate pulses.
     /// </summary>
     public bool AcknowledgeLastCapture()
     {
@@ -333,8 +334,9 @@ internal sealed class KeyboardHook : IDisposable
 
     /// <summary>
     /// Rebuilds the validated binding table after a config reload. The caller owns the
-    /// Config instance; this method does not rewrite raw values. Existing pressed-key state
-    /// is retained so a held key cannot become a fresh trigger during reload.
+    /// Config instance; this method does not rewrite raw values. The subsequent bounded
+    /// reinstall clears stale pressed-key state so a missed key-up cannot suppress the
+    /// next real trigger.
     /// </summary>
     public IReadOnlyList<HotkeyValidationIssue> ReloadConfiguration(Config config)
     {
@@ -390,12 +392,9 @@ internal sealed class KeyboardHook : IDisposable
         Volatile.Write(ref _config, config);
         RecoveryHotkeyBinding[] bindings = config.GetRecoveryHotkeys().ToArray();
         IReadOnlyList<HotkeyValidationIssue> issues = config.ValidateHotkeys();
-        lock (_stateGate)
-        {
-            Volatile.Write(ref _bindings, bindings);
-            Volatile.Write(ref _debounceTicks, ToStopwatchTicks(config.GetHotkeyDebounceMs()));
-            _lastAccepted.Clear();
-        }
+        Volatile.Write(ref _bindings, bindings);
+        Volatile.Write(ref _debounceTicks, ToStopwatchTicks(config.GetHotkeyDebounceMs()));
+        ClearDebounceSlots();
 
         foreach (HotkeyValidationIssue issue in issues)
             Log.Warn($"Hotkey config {issue.SettingName}: {issue.Message}; effective {issue.EffectiveBinding}");
@@ -530,6 +529,10 @@ internal sealed class KeyboardHook : IDisposable
     private void InstallRescueHook(string reason)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+
+        // A hook can disappear while a key is held, so do not carry a stale
+        // down-state across a reinstall and suppress the next real chord.
+        _rescueDownKeys.Clear();
 
         if (_rescueHandle != IntPtr.Zero)
         {
@@ -676,6 +679,14 @@ internal sealed class KeyboardHook : IDisposable
     private void InstallHook(string reason)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+
+        // A hook can disappear while a key is held, so do not carry a stale
+        // down-state across a reinstall and suppress the next real chord.
+        _downKeys.Clear();
+        _altDown = IsKeyDown(Native.VK_MENU);
+        _ctrlDown = IsKeyDown(Native.VK_CONTROL);
+        _shiftDown = IsKeyDown(Native.VK_SHIFT);
+        _winDown = IsKeyDown(0x5B) || IsKeyDown(0x5C);
 
         if (_handle != IntPtr.Zero)
         {
@@ -902,16 +913,25 @@ internal sealed class KeyboardHook : IDisposable
             return;
         }
 
+        bool delivered = false;
         if (Volatile.Read(ref _disposed) == 0)
         {
-            try { RecoveryActionRequested?.Invoke(this, args); }
+            try
+            {
+                RecoveryActionRequested?.Invoke(this, args);
+                delivered = RecoveryActionRequested is not null;
+            }
             catch (Exception ex) { Log.Error("Recovery hotkey event handler failed", ex); }
 
             if (legacyCallback is not null)
             {
-                try { legacyCallback(); }
+                try { legacyCallback(); delivered = true; }
                 catch (Exception ex) { Log.Error("Legacy hotkey callback failed", ex); }
             }
+
+            // Acknowledge only after a live dispatch worker has delivered the
+            // request. Queue insertion alone is not proof that recovery can run.
+            if (delivered) _ = _rescueBroker.TryAcknowledgeFast();
         }
 
         ClearDispatchSlot(slot);
@@ -1116,12 +1136,40 @@ internal sealed class KeyboardHook : IDisposable
         if (repeat) return false;
         long now = Stopwatch.GetTimestamp();
         long debounceTicks = Volatile.Read(ref _debounceTicks);
-        if (_lastAccepted.TryGetValue(signature, out long previous) &&
-            now - previous < debounceTicks)
-            return false;
+        int start = (StringComparer.OrdinalIgnoreCase.GetHashCode(signature) & int.MaxValue) % _debounceSlots.Length;
+        for (int offset = 0; offset < _debounceSlots.Length; offset++)
+        {
+            DebounceSlot slot = _debounceSlots[(start + offset) % _debounceSlots.Length];
+            string? existing = Volatile.Read(ref slot.Signature);
+            if (existing is null)
+            {
+                if (Interlocked.CompareExchange(ref slot.Signature, DEBOUNCE_CLAIM, null) is null)
+                {
+                    Volatile.Write(ref slot.AcceptedTicks, now);
+                    Volatile.Write(ref slot.Signature, signature);
+                    return true;
+                }
+                continue;
+            }
 
-        _lastAccepted[signature] = now;
-        return true;
+            // Another hook callback is publishing the same slot. Treat this
+            // event as a duplicate instead of probing another slot and allowing
+            // a tiny publication window to bypass debounce.
+            if (existing == DEBOUNCE_CLAIM) return false;
+
+            if (!StringComparer.OrdinalIgnoreCase.Equals(existing, signature)) continue;
+            long previous = Volatile.Read(ref slot.AcceptedTicks);
+            if (now - previous < debounceTicks) return false;
+            if (Interlocked.CompareExchange(ref slot.AcceptedTicks, now, previous) == previous)
+                return true;
+            offset--;
+        }
+
+        // Validated configuration has only four possible capture signatures
+        // (Alt+F4 plus three bindings), so reaching this point indicates an
+        // unexpected corruption rather than normal pressure.
+        Interlocked.Increment(ref _droppedDispatchCount);
+        return false;
     }
 
     private bool QueueAction(RecoveryHotkeyEventArgs args, Action? legacyCallback)
@@ -1143,7 +1191,6 @@ internal sealed class KeyboardHook : IDisposable
                     slot.LegacyCallback = legacyCallback;
                     _dispatchQueue.Enqueue(slot);
                     _dispatchWake.Set();
-                    _ = _rescueBroker.TryAcknowledgeFast();
                     return true;
                 }
             }
@@ -1155,10 +1202,11 @@ internal sealed class KeyboardHook : IDisposable
 
         // A reserved slot keeps the emergency path lossless when dispatch cleanup
         // briefly owns the normal ring. It is never allowed to block the hook.
-        if (Interlocked.CompareExchange(ref _emergencyDispatchState, 1, 0) == 0)
+        if (Interlocked.CompareExchange(ref _emergencyDispatchState, EMERGENCY_WRITING, 0) == 0)
         {
             _emergencyDispatchSlot.Args = args;
             _emergencyDispatchSlot.LegacyCallback = legacyCallback;
+            Volatile.Write(ref _emergencyDispatchState, 1);
             try { _dispatchWake.Set(); }
             catch
             {
@@ -1166,7 +1214,6 @@ internal sealed class KeyboardHook : IDisposable
                 _emergencyDispatchSlot.LegacyCallback = null;
                 Volatile.Write(ref _emergencyDispatchState, 0);
             }
-            _ = _rescueBroker.TryAcknowledgeFast();
             return true;
         }
 
@@ -1189,7 +1236,7 @@ internal sealed class KeyboardHook : IDisposable
         Volatile.Write(ref _lastCapture, new CaptureBox(receipt));
 
         // Signal before queueing the typed event. A helper waiting on the named
-        // event therefore receives a capture receipt even if the main dispatcher
+        // event therefore receives a capture pulse even if the main dispatcher
         // is briefly starved or the UI thread is blocked.
         _ = _rescueBroker.TrySignalFast(args.Hotkey);
     }
@@ -1310,6 +1357,22 @@ internal sealed class KeyboardHook : IDisposable
         return slots;
     }
 
+    private void ClearDebounceSlots()
+    {
+        foreach (DebounceSlot slot in _debounceSlots)
+        {
+            Volatile.Write(ref slot.AcceptedTicks, 0L);
+            Volatile.Write(ref slot.Signature, (string?)null);
+        }
+    }
+
+    private static DebounceSlot[] CreateDebounceSlots()
+    {
+        var slots = new DebounceSlot[DEBOUNCE_SLOT_COUNT];
+        for (int i = 0; i < slots.Length; i++) slots[i] = new DebounceSlot();
+        return slots;
+    }
+
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
 
@@ -1365,6 +1428,12 @@ internal sealed class KeyboardHook : IDisposable
         public bool IsEmergency;
         public RecoveryHotkeyEventArgs? Args;
         public Action? LegacyCallback;
+    }
+
+    private sealed class DebounceSlot
+    {
+        internal string? Signature;
+        internal long AcceptedTicks;
     }
 
     private sealed class CaptureBox

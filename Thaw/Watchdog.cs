@@ -201,8 +201,9 @@ internal sealed class Watchdog : IDisposable
             {
                 IsBackground = true,
                 Name = "Thaw.Watchdog",
-                Priority = ThreadPriority.Highest,
             };
+            try { _thread.Priority = ThreadPriority.Highest; }
+            catch (Exception ex) { Log.Debug("Watchdog thread priority unavailable: " + ex.Message); }
             _thread.Start();
         }
         catch

@@ -354,8 +354,9 @@ single hook does not erase the user's emergency request:
    never allowed to run the recovery engine synchronously; if an extreme burst fills both
    paths, the dropped count is surfaced instead of hiding the loss.
 4. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
-   event and the dispatch path immediately pulses a paired acknowledgement event. The
-   optional helper can distinguish an accepted in-process request from a missing one.
+   event and the dispatch worker pulses a paired acknowledgement event only after it has
+   delivered the request. Sequence gating prevents duplicate acknowledgements from leaving
+   stale fallback pulses.
 5. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
    `RegisterHotKey` registrations for always-on panic/frame-drop chords. If the main process
    does not acknowledge a request within the bounded window, it starts one headless,

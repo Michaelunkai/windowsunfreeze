@@ -338,8 +338,9 @@ public sealed class Telemetry : IDisposable
             {
                 IsBackground = true,
                 Name = "Thaw.Telemetry",
-                Priority = ThreadPriority.BelowNormal,
             };
+            try { _thread.Priority = ThreadPriority.BelowNormal; }
+            catch (Exception ex) { Log.Debug("Telemetry thread priority unavailable: " + ex.Message); }
             _thread.Start();
         }
         catch

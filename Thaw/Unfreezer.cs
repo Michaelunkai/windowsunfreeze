@@ -221,8 +221,8 @@ internal sealed class Unfreezer : IDisposable
             {
                 IsBackground = true,
                 Name = "Thaw.Unfreezer",
-                Priority = ThreadPriority.Highest,
             };
+            TrySetThreadPriority(thread, ThreadPriority.Highest, "Thaw.Unfreezer");
             thread.Start();
             return true;
         }
@@ -555,8 +555,8 @@ internal sealed class Unfreezer : IDisposable
                 {
                     IsBackground = true,
                     Name = "Thaw.DisplayRecovery",
-                    Priority = ThreadPriority.Highest,
                 };
+                TrySetThreadPriority(displayWorker, ThreadPriority.Highest, "Thaw.DisplayRecovery");
                 displayWorker.Start();
             }
             else if (!allowDisplayRecovery)
@@ -593,8 +593,8 @@ internal sealed class Unfreezer : IDisposable
                 {
                     IsBackground = true,
                     Name = "Thaw.ExplorerForceAll",
-                    Priority = ThreadPriority.Highest,
                 };
+                TrySetThreadPriority(shellWorker, ThreadPriority.Highest, "Thaw.ExplorerForceAll");
                 shellWorker.Start();
             }
 
@@ -612,8 +612,8 @@ internal sealed class Unfreezer : IDisposable
                 {
                     IsBackground = true,
                     Name = "Thaw.PowerForceAll",
-                    Priority = ThreadPriority.Highest,
                 };
+                TrySetThreadPriority(powerWorker, ThreadPriority.Highest, "Thaw.PowerForceAll");
                 powerWorker.Start();
             }
 
@@ -1848,7 +1848,8 @@ internal sealed class Unfreezer : IDisposable
                     Interlocked.Exchange(ref _active, 0);
                 }
             })
-            { IsBackground = true, Name = "Thaw.ExplorerRestart", Priority = ThreadPriority.Highest };
+            { IsBackground = true, Name = "Thaw.ExplorerRestart" };
+            TrySetThreadPriority(t, ThreadPriority.Highest, "Thaw.ExplorerRestart");
             t.Start();
         }
         catch (Exception ex)
@@ -2305,6 +2306,12 @@ internal sealed class Unfreezer : IDisposable
     {
         long remaining = deadline - Environment.TickCount64;
         return (int)Math.Clamp(remaining, 0, int.MaxValue);
+    }
+
+    private static void TrySetThreadPriority(Thread thread, ThreadPriority priority, string name)
+    {
+        try { thread.Priority = priority; }
+        catch (Exception ex) { Log.Debug($"{name} priority unavailable: {ex.Message}"); }
     }
 
     public void Dispose()

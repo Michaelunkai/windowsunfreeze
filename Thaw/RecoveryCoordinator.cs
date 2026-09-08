@@ -395,8 +395,8 @@ internal sealed class RecoveryCoordinator : IDisposable
             {
                 IsBackground = true,
                 Name = "Thaw.RecoveryWorker." + i,
-                Priority = ThreadPriority.Highest,
             };
+            TrySetPriority(thread, ThreadPriority.Highest, thread.Name);
             thread.Start();
             return thread;
         }).ToArray();
@@ -498,8 +498,8 @@ internal sealed class RecoveryCoordinator : IDisposable
             {
                 IsBackground = true,
                 Name = "Thaw.RecoveryDrain",
-                Priority = ThreadPriority.BelowNormal,
             };
+            TrySetPriority(drainThread, ThreadPriority.BelowNormal, drainThread.Name);
             drainThread.Start();
         }
         return complete;
@@ -547,6 +547,17 @@ internal sealed class RecoveryCoordinator : IDisposable
                 state.Failures++;
             if (state.Failures >= CircuitFailureThreshold)
                 state.OpenUntil = Environment.TickCount64 + CircuitCooldownMs;
+        }
+    }
+
+    private static void TrySetPriority(Thread thread, ThreadPriority priority, string? name)
+    {
+        try { thread.Priority = priority; }
+        catch (Exception ex)
+        {
+            Log.Debug("Recovery thread priority unavailable" +
+                      (string.IsNullOrWhiteSpace(name) ? string.Empty : " (" + name + ")") +
+                      ": " + ex.Message);
         }
     }
 

@@ -304,6 +304,8 @@ internal static class Program
                     !channel.Wait(0, out RescueSignal signal) || signal.Sequence == 0 ||
                     !channel.TryAcknowledgeFast() || !channel.WaitForAcknowledgement(0))
                     throw new InvalidOperationException("rescue signal/acknowledgement channel did not round-trip");
+                if (!channel.TryAcknowledgeFast() || channel.WaitForAcknowledgement(0))
+                    throw new InvalidOperationException("duplicate rescue acknowledgement produced a stale pulse");
                 Console.WriteLine("Self-test: PASS — per-user rescue event and acknowledgement channel round-trip");
             }
             catch (Exception ex)
@@ -435,10 +437,10 @@ internal static class Program
                 : null;
         if (helperMode is null) return;
 
-        string? exe = Environment.ProcessPath;
+        string? exe = GetThawExecutablePath();
         if (string.IsNullOrWhiteSpace(exe))
         {
-            Log.Warn("Thaw-only helper not started: Environment.ProcessPath is unavailable");
+            Log.Warn("Thaw-only helper not started: the Thaw executable path is unavailable");
             return;
         }
 
@@ -580,22 +582,39 @@ internal static class Program
         using var broker = new RescueBroker();
         broker.DrainAcknowledgements();
         var state = new RescueFallbackState();
-        using var hotkeys = new RescueHotkeyMonitor(
-            config,
-            binding => HandleRescueRequest(parent, broker, state, "registered:" + binding.Chord.Text));
+        RescueHotkeyMonitor? hotkeys = null;
+        try
+        {
+            hotkeys = new RescueHotkeyMonitor(
+                config,
+                binding => HandleRescueRequest(parent, broker, state, "registered:" + binding.Chord.Text));
+        }
+        catch (Exception ex)
+        {
+            // Keep the named-event listener alive even if the optional
+            // RegisterHotKey thread cannot be created on this host.
+            Console.Error.WriteLine("Rescue registered-hotkey path unavailable: " + ex.Message);
+        }
 
         Console.WriteLine($"Thaw-only rescue broker monitoring PID {parent.Id}; " +
-                          $"registered hotkeys={hotkeys.RegisteredCount}; event={broker.IsAvailable}.");
+                          $"registered hotkeys={hotkeys?.RegisteredCount ?? 0}; event={broker.IsAvailable}.");
 
-        while (true)
+        try
         {
-            bool exited;
-            try { exited = parent.WaitForExit(100); }
-            catch { exited = true; }
-            if (exited) break;
+            while (true)
+            {
+                bool exited;
+                try { exited = parent.WaitForExit(100); }
+                catch { exited = true; }
+                if (exited) break;
 
-            if (broker.Wait(100, out RescueSignal signal))
-                HandleRescueRequest(parent, broker, state, "event:" + signal.Reason);
+                if (broker.Wait(100, out RescueSignal signal))
+                    HandleRescueRequest(parent, broker, state, "event:" + signal.Reason);
+            }
+        }
+        finally
+        {
+            try { hotkeys?.Dispose(); } catch { }
         }
 
         int exitCode = 0;
@@ -653,7 +672,7 @@ internal static class Program
         if (Interlocked.CompareExchange(ref state.FallbackInFlight, 1, 0) != 0)
             return;
 
-        string? exe = Environment.ProcessPath;
+        string? exe = GetThawExecutablePath();
         if (string.IsNullOrWhiteSpace(exe))
         {
             Interlocked.Exchange(ref state.FallbackInFlight, 0);
@@ -693,7 +712,7 @@ internal static class Program
 
     private static int RelaunchThawOnly()
     {
-        string? exe = Environment.ProcessPath;
+        string? exe = GetThawExecutablePath();
         if (string.IsNullOrWhiteSpace(exe)) return 3;
         try
         {
@@ -718,7 +737,7 @@ internal static class Program
 
     private static bool IsThawProcess(Process process)
     {
-        string? expected = Environment.ProcessPath;
+        string? expected = GetThawExecutablePath();
         if (string.IsNullOrWhiteSpace(expected)) return false;
         try
         {
@@ -730,6 +749,34 @@ internal static class Program
         {
             return false;
         }
+    }
+
+    private static string? GetThawExecutablePath()
+    {
+        string? current = null;
+        try
+        {
+            current = Environment.ProcessPath;
+            if (IsThawExecutablePath(current)) return current;
+        }
+        catch { }
+
+        try
+        {
+            string candidate = Path.Combine(System.AppContext.BaseDirectory, "Thaw.exe");
+            if (File.Exists(candidate)) return candidate;
+        }
+        catch { }
+
+        return current;
+    }
+
+    private static bool IsThawExecutablePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        string name = Path.GetFileNameWithoutExtension(path);
+        return string.Equals(name, "Thaw", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(name, "Thaw-Portable", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryGetIntArg(string[] args, string name, out int value)

@@ -234,11 +234,11 @@ public sealed class RescueBroker : IDisposable
 
         try
         {
-            lock (_gate)
-            {
-                if (sequence == 0 || sequence >= _lastAcknowledgedSequence)
-                    _lastAcknowledgedSequence = sequence;
-            }
+            long effectiveSequence = sequence == 0
+                ? Interlocked.Read(ref _sequence)
+                : sequence;
+            if (effectiveSequence <= 0) return false;
+            if (!TryReserveAcknowledgement(effectiveSequence)) return true;
             IntPtr handle = _acknowledgementEvent.SafeWaitHandle.DangerousGetHandle();
             return handle != IntPtr.Zero && Native.SetEvent(handle);
         }
@@ -260,6 +260,9 @@ public sealed class RescueBroker : IDisposable
 
         try
         {
+            long sequence = Interlocked.Read(ref _sequence);
+            if (sequence <= 0) return false;
+            if (!TryReserveAcknowledgement(sequence)) return true;
             IntPtr handle = _acknowledgementEvent.SafeWaitHandle.DangerousGetHandle();
             return handle != IntPtr.Zero && Native.SetEvent(handle);
         }
@@ -289,6 +292,17 @@ public sealed class RescueBroker : IDisposable
         if (_acknowledgementEvent is null) return;
         try { while (_acknowledgementEvent.WaitOne(0)) { } }
         catch (Exception ex) { Log.Debug("Rescue broker acknowledgement drain failed: " + ex.Message); }
+    }
+
+    private bool TryReserveAcknowledgement(long sequence)
+    {
+        while (true)
+        {
+            long previous = Volatile.Read(ref _lastAcknowledgedSequence);
+            if (sequence <= previous) return false;
+            if (Interlocked.CompareExchange(ref _lastAcknowledgedSequence, sequence, previous) == previous)
+                return true;
+        }
     }
 
     /// <summary>
