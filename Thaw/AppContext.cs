@@ -791,6 +791,7 @@ internal sealed class AppContext : ApplicationContext
         text.AppendLine("Hook primary installed: " + _hook.IsInstalled);
         text.AppendLine("Hook emergency installed: " + _hook.IsEmergencyInstalled);
         text.AppendLine("Hook capture path available: " + _hook.HasCapturePath);
+        text.AppendLine("Recovery request worker alive: " + _unfreezer.RecoveryWorkerAlive);
         text.AppendLine("Hook registered fallback count: " + _hook.RegisteredFallbackHotkeyCount);
         text.AppendLine("Hook captures/drops/callback errors: " + _hook.CaptureCount + "/" +
                          _hook.DroppedDispatchCount + "/" + _hook.CallbackErrorCount);

@@ -127,6 +127,10 @@ internal sealed class Unfreezer : IDisposable
     private readonly Config _config;
     private readonly Watchdog _watchdog;
     private readonly RecoveryCoordinator _coordinator;
+    private readonly AutoResetEvent _recoveryWake = new(false);
+    private readonly object _recoveryWorkerGate = new();
+    private Thread? _recoveryWorker;
+    private int _pendingReason;
     private int _active;
     private int _disposed;
     private static long _lastDnsFlushTick;
@@ -189,6 +193,7 @@ internal sealed class Unfreezer : IDisposable
         _coordinator = new RecoveryCoordinator(receipt =>
             Log.Debug($"Recovery progress: {receipt.Action} {receipt.Phase} {receipt.Outcome} " +
                       $"({receipt.ElapsedMs} ms) {receipt.Detail}"));
+        EnsureRecoveryWorker("initial");
     }
 
     internal static (bool Display, bool System, bool Memory) GetRecoveryProfile(TriggerReason reason)
@@ -215,22 +220,139 @@ internal sealed class Unfreezer : IDisposable
             return false;
         }
 
-        try
+        int encodedReason = EncodeReason(reason);
+        Interlocked.Exchange(ref _pendingReason, encodedReason);
+        if (!QueueRecoveryRequest())
         {
-            var thread = new Thread(() => Run(reason))
+            // If the request was not consumed, release the active fence so a
+            // later shortcut can retry after a transient worker/handle failure.
+            if (Interlocked.CompareExchange(ref _pendingReason, 0, encodedReason) == encodedReason)
+            {
+                Interlocked.Exchange(ref _active, 0);
+                Log.Error("Unable to queue unfreeze request on the pre-warmed worker");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Reports whether the already-running request handoff thread is available.
+    /// A trigger can recreate it if a catastrophic thread failure ever removes it.
+    /// </summary>
+    public bool RecoveryWorkerAlive => Volatile.Read(ref _recoveryWorker)?.IsAlive == true;
+
+    private bool QueueRecoveryRequest()
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return false;
+            if (!EnsureRecoveryWorker(attempt == 0 ? "trigger" : "trigger-retry")) continue;
+
+            Thread? worker = Volatile.Read(ref _recoveryWorker);
+            if (worker?.IsAlive != true) continue;
+            try
+            {
+                _recoveryWake.Set();
+                // A worker can fail in the tiny window between the liveness
+                // check and Set(). Retry once through EnsureRecoveryWorker so
+                // the accepted request is not stranded behind a dead thread.
+                if (worker.IsAlive) return true;
+                Log.Debug("Recovery request worker exited during wake; retrying handoff");
+            }
+            catch (Exception ex)
+            {
+                Log.Debug("Unfreeze request wake failed: " + ex.Message);
+            }
+        }
+
+        return false;
+    }
+
+    private bool EnsureRecoveryWorker(string reason)
+    {
+        lock (_recoveryWorkerGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return false;
+            if (_recoveryWorker?.IsAlive == true) return true;
+
+            var replacement = new Thread(RecoveryRequestWorkerMain)
             {
                 IsBackground = true,
-                Name = "Thaw.Unfreezer",
+                Name = "Thaw recovery request worker",
             };
-            TrySetThreadPriority(thread, ThreadPriority.Highest, "Thaw.Unfreezer");
-            thread.Start();
-            return true;
+            TrySetThreadPriority(replacement, ThreadPriority.Highest, replacement.Name);
+            Volatile.Write(ref _recoveryWorker, replacement);
+            try
+            {
+                replacement.Start();
+                if (!string.Equals(reason, "initial", StringComparison.OrdinalIgnoreCase))
+                    Log.Info("Pre-warmed recovery request worker started (" + reason + ")");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (ReferenceEquals(Volatile.Read(ref _recoveryWorker), replacement))
+                    Volatile.Write(ref _recoveryWorker, null);
+                Log.Error("Unable to start pre-warmed recovery request worker", ex);
+                return false;
+            }
+        }
+    }
+
+    private void RecoveryRequestWorkerMain()
+    {
+        try
+        {
+            while (Volatile.Read(ref _disposed) == 0)
+            {
+                try
+                {
+                    _recoveryWake.WaitOne();
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Recovery request worker wait failed; retrying", ex);
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    try { Thread.Sleep(25); } catch { }
+                    continue;
+                }
+
+                if (Volatile.Read(ref _disposed) != 0) break;
+                int encodedReason = Interlocked.Exchange(ref _pendingReason, 0);
+                if (encodedReason <= 0) continue;
+
+                try
+                {
+                    Run((TriggerReason)(encodedReason - 1));
+                }
+                catch (Exception ex)
+                {
+                    // Run has its own final boundary; this guard protects the
+                    // pre-warmed handoff if a future change escapes that boundary.
+                    Log.Error("Recovery request worker escaped the run boundary", ex);
+                    Interlocked.Exchange(ref _active, 0);
+                }
+            }
         }
         catch (Exception ex)
         {
-            Interlocked.Exchange(ref _active, 0);
-            Log.Error("Unable to start unfreeze worker", ex);
-            return false;
+            Log.Error("Recovery request worker failed", ex);
+        }
+        finally
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+            {
+                Interlocked.Exchange(ref _pendingReason, 0);
+                Interlocked.Exchange(ref _active, 0);
+            }
+            if (ReferenceEquals(Volatile.Read(ref _recoveryWorker), Thread.CurrentThread))
+                Volatile.Write(ref _recoveryWorker, null);
         }
     }
 
@@ -2390,6 +2512,8 @@ internal sealed class Unfreezer : IDisposable
         return (int)Math.Clamp(remaining, 0, int.MaxValue);
     }
 
+    private static int EncodeReason(TriggerReason reason) => (int)reason + 1;
+
     private static void TrySetThreadPriority(Thread thread, ThreadPriority priority, string name)
     {
         try { thread.Priority = priority; }
@@ -2398,7 +2522,23 @@ internal sealed class Unfreezer : IDisposable
 
     public void Dispose()
     {
-        Interlocked.Exchange(ref _disposed, 1);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        Interlocked.Exchange(ref _pendingReason, 0);
+        try { _recoveryWake.Set(); } catch { }
+
+        Thread? worker = Volatile.Read(ref _recoveryWorker);
+        if (worker is not null && worker != Thread.CurrentThread)
+        {
+            try { worker.Join(2000); } catch { }
+        }
+        bool workerStopped = worker is null || !worker.IsAlive;
+        if (!workerStopped)
+            Log.Debug("Recovery request worker did not stop within 2 s; preserving its wake handle");
+
         try { _coordinator.Dispose(); } catch (Exception ex) { Log.Debug("Recovery coordinator dispose failed: " + ex.Message); }
+        if (workerStopped)
+        {
+            try { _recoveryWake.Dispose(); } catch { }
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.2**
+Version **1.4.3**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -91,7 +91,8 @@ application memory or process dumps.
   dispatch workers also isolate delivery/queue exceptions and retry their loops without
   clearing already-captured requests; the final worker is an independent pre-warmed
   last-resort slot. Each event subscriber is isolated individually, and AltGr text input
-  is excluded from Ctrl+Alt recovery matching.
+  is excluded from Ctrl+Alt recovery matching. Recovery requests are handed to a pre-warmed
+  high-priority worker, with bounded recreation only if that worker itself exits.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic,
   frame-drop, and Alt+F4 (when `AltF4Mode` is `always`) chords with `RegisterHotKey`; the
@@ -117,8 +118,9 @@ application memory or process dumps.
 - **Tray guard** (`AppContext.cs`) — shows health, privilege level, cooldown, and
   in-progress state. It prevents duplicate normal requests while allowing the emergency
   request to bypass the short cooldown. It cannot cancel an engine pass already running.
-- **Recovery engine** (`Unfreezer.cs`) — applies only the steps enabled by the current
-  configuration. The major surfaces are intentionally documented separately:
+- **Recovery engine** (`Unfreezer.cs`) — accepts requests through a pre-warmed recovery
+  worker and applies only the steps enabled by the current configuration. The major surfaces
+  are intentionally documented separately:
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|
