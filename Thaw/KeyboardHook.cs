@@ -175,6 +175,7 @@ internal sealed class KeyboardHook : IDisposable
     // Modifier state tracked from hook events (robust for synthetic/injected input,
     // RDP and cases where GetAsyncKeyState lags behind the key event).
     private bool _altDown, _ctrlDown, _shiftDown, _winDown;
+    private bool _rescueAltDown, _rescueCtrlDown, _rescueShiftDown, _rescueWinDown;
 
     /// <summary>
     /// Raised for every accepted recovery action. Delivery is asynchronous and exceptions
@@ -798,6 +799,10 @@ internal sealed class KeyboardHook : IDisposable
         // A hook can disappear while a key is held, so do not carry a stale
         // down-state across a reinstall and suppress the next real chord.
         _rescueDownKeys.Clear();
+        _rescueAltDown = IsKeyDown(Native.VK_MENU);
+        _rescueCtrlDown = IsKeyDown(Native.VK_CONTROL);
+        _rescueShiftDown = IsKeyDown(Native.VK_SHIFT);
+        _rescueWinDown = IsKeyDown(0x5B) || IsKeyDown(0x5C);
 
         if (_rescueHandle != IntPtr.Zero)
         {
@@ -878,6 +883,7 @@ internal sealed class KeyboardHook : IDisposable
 
                     bool keyUp = msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP ||
                                  (kbd.flags & LLKHF_UP) != 0;
+                    TrackRescueModifiers(kbd, keyUp);
                     if (keyUp)
                     {
                         _rescueDownKeys.Remove(kbd.vkCode);
@@ -885,11 +891,10 @@ internal sealed class KeyboardHook : IDisposable
                     }
 
                     bool repeat = !_rescueDownKeys.Add(kbd.vkCode);
-                    bool alt = (kbd.flags & LLKHF_ALTDOWN) != 0 || IsKeyDown(Native.VK_MENU);
-                    bool ctrl = IsKeyDown(Native.VK_CONTROL);
-                    bool shift = IsKeyDown(Native.VK_SHIFT);
-                    bool win = IsKeyDown(0x5B) || IsKeyDown(0x5C);
-                    bool altGr = ctrl && IsKeyDown(0xA5);
+                    // The emergency Alt+F4 branch uses only callback-local state
+                    // and the LLKHF_ALTDOWN flag. This avoids extra user32 state
+                    // probes while Windows is waiting for the low-level hook.
+                    bool alt = (kbd.flags & LLKHF_ALTDOWN) != 0 || _rescueAltDown;
 
                     // Keep the exact Alt+F4 swallowing behavior available even if
                     // the primary hook thread is stalled or its handle was removed.
@@ -910,6 +915,10 @@ internal sealed class KeyboardHook : IDisposable
                         return (IntPtr)1;
                     }
 
+                    bool ctrl = _rescueCtrlDown;
+                    bool shift = _rescueShiftDown;
+                    bool win = _rescueWinDown;
+                    bool altGr = false;
                     RecoveryHotkeyBinding[] bindings = Volatile.Read(ref _bindings);
                     foreach (RecoveryHotkeyBinding binding in bindings)
                     {
@@ -1676,6 +1685,29 @@ internal sealed class KeyboardHook : IDisposable
             case 0x5B: // VK_LWIN
             case 0x5C: // VK_RWIN
                 _winDown = down; break;
+        }
+    }
+
+    private void TrackRescueModifiers(in KBDLLHOOKSTRUCT kbd, bool keyUp)
+    {
+        bool down = !keyUp;
+        switch (kbd.vkCode)
+        {
+            case 0x12: // VK_MENU (generic)
+            case 0xA4: // VK_LMENU
+            case 0xA5: // VK_RMENU
+                _rescueAltDown = down; break;
+            case 0x11: // VK_CONTROL (generic)
+            case 0xA2: // VK_LCONTROL
+            case 0xA3: // VK_RCONTROL
+                _rescueCtrlDown = down; break;
+            case 0x10: // VK_SHIFT (generic)
+            case 0xA0: // VK_LSHIFT
+            case 0xA1: // VK_RSHIFT
+                _rescueShiftDown = down; break;
+            case 0x5B: // VK_LWIN
+            case 0x5C: // VK_RWIN
+                _rescueWinDown = down; break;
         }
     }
 

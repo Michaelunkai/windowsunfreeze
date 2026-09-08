@@ -438,7 +438,7 @@ internal sealed class RecoveryCoordinator : IDisposable
 
     internal static IReadOnlyList<string> SafeReversibleActions { get; } = new[]
     {
-        "display-reset", "foreground-qos", "background-demotion", "working-set-trim",
+        "display-reset", "dwm-mmcss", "foreground-qos", "background-demotion", "working-set-trim",
         "memory-cache", "shell-refresh", "dns-refresh", "power-plan", "mmcss", "cpu-sets",
         "audio-diagnostic", "desktop-refresh", "foreground-probe", "resource-diagnostics",
     };
@@ -1066,8 +1066,8 @@ internal sealed class RecoveryCoordinator : IDisposable
                 Add("shell-refresh");
                 break;
             default:
-                if (reason == TriggerReason.FrameDrop) { Add("display-reset"); Add("mmcss"); }
-                else if (reason == TriggerReason.Panic) { Add("display-reset"); Add("foreground-qos"); }
+                if (reason == TriggerReason.FrameDrop) { Add("display-reset"); Add("dwm-mmcss"); Add("mmcss"); }
+                else if (reason == TriggerReason.Panic) { Add("display-reset"); Add("dwm-mmcss"); Add("mmcss"); Add("foreground-qos"); }
                 else if (reason == TriggerReason.Manual) Add("foreground-qos");
                 break;
         }

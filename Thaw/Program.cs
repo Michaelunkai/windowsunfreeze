@@ -355,7 +355,7 @@ internal static class Program
                     explorerHung: true);
                 string[] requiredActions =
                 {
-                    "desktop-refresh", "foreground-probe", "resource-diagnostics",
+                    "desktop-refresh", "dwm-mmcss", "foreground-probe", "resource-diagnostics",
                     "audio-diagnostic", "dns-refresh", "memory-cache",
                 };
                 if (forceActions.Count > RecoveryCoordinator.MaxActionWorkers ||
@@ -524,33 +524,61 @@ internal static class Program
     /// </summary>
     private static int RunRescueFallback()
     {
-        Config config = Config.Load(ConfigPathWithoutCreating());
-        Log.Init(config.DebugLog);
-        using var watchdog = new Watchdog(config);
-        using var unfreezer = new Unfreezer(config, watchdog);
-        using var completed = new ManualResetEventSlim(false);
-        UnfreezeStats? result = null;
-        unfreezer.Completed += stats =>
-        {
-            result = stats;
-            completed.Set();
-        };
+        Config config = new();
+        try { config = Config.Load(ConfigPathWithoutCreating()); }
+        catch (Exception ex) { Console.Error.WriteLine("Rescue fallback config load failed: " + ex.Message); }
 
-        Console.WriteLine("Thaw rescue fallback: starting bounded force-all recovery.");
-        if (!unfreezer.Trigger(TriggerReason.Hotkey))
+        try
         {
-            Console.Error.WriteLine("Thaw rescue fallback: recovery could not start.");
+            try { Log.Init(config.DebugLog); } catch { }
+            using var watchdog = new Watchdog(config);
+            using var unfreezer = new Unfreezer(config, watchdog);
+            using var completed = new ManualResetEventSlim(false);
+            UnfreezeStats? result = null;
+            unfreezer.Completed += stats =>
+            {
+                result = stats;
+                completed.Set();
+            };
+
+            Console.WriteLine("Thaw rescue fallback: starting bounded force-all recovery.");
+            if (!unfreezer.Trigger(TriggerReason.Hotkey))
+            {
+                Console.Error.WriteLine("Thaw rescue fallback: full recovery handoff unavailable.");
+                return RunMinimalRescueFallback("full recovery handoff unavailable");
+            }
+
+            if (!completed.Wait(Unfreezer.RecoveryBudgetMs + 5_000))
+            {
+                Console.Error.WriteLine("Thaw rescue fallback: bounded recovery did not report completion.");
+                return 4;
+            }
+
+            Console.WriteLine("Thaw rescue fallback: " + (result?.Summary ?? "completed without a receipt"));
+            return result?.OverallOutcome == RecoveryOutcome.Worse ? 5 : 0;
+        }
+        catch (Exception ex)
+        {
+            try { Log.Error("Thaw rescue fallback full engine failed", ex); } catch { }
+            return RunMinimalRescueFallback("full engine startup failed");
+        }
+    }
+
+    private static int RunMinimalRescueFallback(string reason)
+    {
+        try
+        {
+            Console.WriteLine("Thaw rescue fallback: " + reason + "; submitting minimal graphics reset.");
+            bool accepted = Unfreezer.TryEmergencyDisplayReset();
+            Console.WriteLine("Thaw rescue fallback: minimal graphics reset " +
+                              (accepted ? "accepted." : "unavailable."));
+            return accepted ? 0 : 3;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Thaw rescue fallback: minimal graphics reset failed: " + ex.Message);
             return 3;
         }
-
-        if (!completed.Wait(Unfreezer.RecoveryBudgetMs + 5_000))
-        {
-            Console.Error.WriteLine("Thaw rescue fallback: bounded recovery did not report completion.");
-            return 4;
-        }
-
-        Console.WriteLine("Thaw rescue fallback: " + (result?.Summary ?? "completed without a receipt"));
-        return result?.OverallOutcome == RecoveryOutcome.Worse ? 5 : 0;
     }
 
     private sealed class RescueFallbackState

@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.8–1.4.11)
+## Capture-path hardening (1.4.8–1.4.13)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -443,6 +443,21 @@ single hook does not erase the user's emergency request:
    coordinator closes the partial batch while holding the queue gate, wakes the workers, and keeps
    the active-run reservation until any already-running action drains. Queued actions therefore
    finish as skipped instead of becoming untracked recovery mutations.
+22. **DWM scheduling assist** — display-oriented panic, frame-drop, and Alt+F4 recovery can
+   temporarily enable DWM participation in MMCSS, then restore the documented default through
+   the rollback journal. This gives the compositor a bounded scheduling boost without leaving a
+   persistent policy change.
+23. **Resource-starved rescue fallback** — if the separate rescue helper cannot construct or hand
+   off the full recovery engine, it still submits the allocation-light Ctrl+Shift+Win+B graphics
+   reset directly instead of exiting without any recovery attempt. A failed full handoff therefore
+   produces an explicit bounded result and one last native display-recovery attempt.
+24. **Emergency callback fast path** — the independent rescue hook tracks modifier state locally and
+     handles Alt+F4 without additional asynchronous key-state probes, reducing callback work while
+     Windows is waiting for the low-level hook decision. Custom chords retain the existing state
+     fallback for missed modifier events.
+25. **Resource-safe worker creation** — recovery-worker construction, priority setup, publication, and
+    thread start share one guarded boundary, so an allocation or start failure becomes a bounded
+    handoff failure instead of escaping before the shortcut can publish its terminal receipt.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

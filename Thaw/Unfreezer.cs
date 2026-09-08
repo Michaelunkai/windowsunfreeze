@@ -279,15 +279,16 @@ internal sealed class Unfreezer : IDisposable
             if (Volatile.Read(ref _disposed) != 0) return false;
             if (_recoveryWorker?.IsAlive == true) return true;
 
-            var replacement = new Thread(RecoveryRequestWorkerMain)
-            {
-                IsBackground = true,
-                Name = "Thaw recovery request worker",
-            };
-            TrySetThreadPriority(replacement, ThreadPriority.Highest, replacement.Name);
-            Volatile.Write(ref _recoveryWorker, replacement);
+            Thread? replacement = null;
             try
             {
+                replacement = new Thread(RecoveryRequestWorkerMain)
+                {
+                    IsBackground = true,
+                    Name = "Thaw recovery request worker",
+                };
+                TrySetThreadPriority(replacement, ThreadPriority.Highest, replacement.Name);
+                Volatile.Write(ref _recoveryWorker, replacement);
                 replacement.Start();
                 if (!string.Equals(reason, "initial", StringComparison.OrdinalIgnoreCase))
                     Log.Info("Pre-warmed recovery request worker started (" + reason + ")");
@@ -295,7 +296,7 @@ internal sealed class Unfreezer : IDisposable
             }
             catch (Exception ex)
             {
-                if (ReferenceEquals(Volatile.Read(ref _recoveryWorker), replacement))
+                if (replacement is not null && ReferenceEquals(Volatile.Read(ref _recoveryWorker), replacement))
                     Volatile.Write(ref _recoveryWorker, null);
                 Log.Error("Unable to start pre-warmed recovery request worker", ex);
                 return false;
@@ -1175,6 +1176,36 @@ internal sealed class Unfreezer : IDisposable
                 return ok ? RecoveryActionResult.AcceptedRequest("SendInput accepted; display proof pending") :
                             RecoveryActionResult.SkippedResult("graphics reset request unavailable");
             }, "display-reset");
+        }
+
+        if (profile.Display && Wants("dwm-mmcss") &&
+            (forceAll || reason is TriggerReason.Panic or TriggerReason.FrameDrop))
+        {
+            Add("dwm-mmcss", 350, _ =>
+            {
+                IDisposable? revertScope = null;
+                if (!NativeDiagnostics.TryEnableDwmMmcss(out revertScope) || revertScope is null)
+                    return RecoveryActionResult.SkippedResult("DWM MMCSS helper unavailable");
+
+                try
+                {
+                    // DwmEnableMMCSS has no query API. The helper scope restores
+                    // the documented default after this bounded recovery run.
+                    journal.RecordResult("dwm-mmcss", () =>
+                    {
+                        try { revertScope.Dispose(); return true; }
+                        catch { return false; }
+                    });
+                }
+                catch
+                {
+                    try { revertScope.Dispose(); } catch { }
+                    throw;
+                }
+
+                return RecoveryActionResult.AcceptedRequest(
+                    "DWM MMCSS participation enabled; rollback journal armed");
+            }, "dwm-mmcss");
         }
 
         if (profile.Display && _config.RestartDwmOnFrozenScreen &&
@@ -2203,6 +2234,19 @@ internal sealed class Unfreezer : IDisposable
     /// <summary>Ctrl+Shift+Win+B — the documented Windows graphics-driver reset.</summary>
     private static bool ResetGpuDriver(RecoveryCounters counters)
     {
+        bool ok = TryEmergencyDisplayReset();
+        if (ok) counters.Succeeded("gpu-reset", "accepted=8");
+        else counters.Skipped("gpu-reset", "graphics reset request unavailable");
+        return ok;
+    }
+
+    /// <summary>
+    /// Last-resort, allocation-light display recovery for the rescue helper. It
+    /// deliberately bypasses the full coordinator so a resource-starved helper
+    /// can still submit the documented graphics reset.
+    /// </summary>
+    internal static bool TryEmergencyDisplayReset()
+    {
         try
         {
             // Submit the whole sequence in one call so a partial failure cannot
@@ -2216,14 +2260,11 @@ internal sealed class Unfreezer : IDisposable
             uint accepted = Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Native.INPUT>());
             bool ok = accepted == (uint)inputs.Length;
             Log.Info($"GPU driver reset request: requested={inputs.Length}, accepted={accepted}, success={ok}");
-            if (ok) counters.Succeeded("gpu-reset", $"accepted={accepted}");
-            else counters.Skipped("gpu-reset", $"accepted={accepted}/{inputs.Length}");
             return ok;
         }
         catch (Exception ex)
         {
             Log.Error("GPU reset failed", ex);
-            counters.Skipped("gpu-reset", "exception");
             return false;
         }
     }
