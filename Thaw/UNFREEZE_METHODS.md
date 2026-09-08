@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.7)
+## Capture-path hardening (1.4.8)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -400,7 +400,11 @@ single hook does not erase the user's emergency request:
 9. **Probe-failure containment** — unavailable memory, foreground, DWM, Explorer, or
    telemetry probes fall back to bounded defaults/watchdog evidence and still dispatch the
    configured recovery graph. Probe-detail logging is deferred until workers are signalled.
-10. **Capture telemetry** — support diagnostics expose primary/emergency installation,
+10. **Dispatch-fence cleanup** — the coordinator closes every action batch in a `finally`
+   path even if its bounded wait faults. If late workers remain, the active-run reservation is
+   held until they drain; if a drain watcher cannot be started, the owner waits safely instead
+   of allowing late native mutations to overlap a newer shortcut recovery.
+11. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.
 

@@ -498,8 +498,22 @@ internal sealed class RecoveryCoordinator : IDisposable
 
     internal bool Wait(RecoveryDispatch dispatch, long deadlineTick)
     {
-        bool complete = dispatch.WaitUntil(deadlineTick, OpenCircuit);
-        if (!complete) Log.Warn("Recovery dispatch reached its global deadline; late actions are isolated by circuit breakers");
+        try
+        {
+            bool complete = dispatch.WaitUntil(deadlineTick, OpenCircuit);
+            if (!complete) Log.Warn("Recovery dispatch reached its global deadline; late actions are isolated by circuit breakers");
+            return complete;
+        }
+        finally
+        {
+            // A fault in the bounded wait must not strand the coordinator's
+            // reservation or leave late workers outside the closed batch.
+            FinishDispatch(dispatch);
+        }
+    }
+
+    private void FinishDispatch(RecoveryDispatch dispatch)
+    {
         dispatch.Close();
         if (dispatch.IsDrained)
         {
@@ -520,9 +534,20 @@ internal sealed class RecoveryCoordinator : IDisposable
                 Name = "Thaw.RecoveryDrain",
             };
             TrySetPriority(drainThread, ThreadPriority.BelowNormal, drainThread.Name);
-            drainThread.Start();
+            try
+            {
+                drainThread.Start();
+            }
+            catch (Exception ex)
+            {
+                // Thread creation can fail under severe resource pressure.
+                // Wait synchronously as a safe fallback so a late native
+                // mutation never overlaps a later recovery run.
+                Log.Error("Unable to start recovery drain watcher; waiting synchronously", ex);
+                try { dispatch.WaitForDrain(); }
+                finally { Interlocked.Exchange(ref _activeDispatch, 0); }
+            }
         }
-        return complete;
     }
 
     internal bool OpenCircuit(string key)

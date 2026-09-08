@@ -228,12 +228,15 @@ public sealed class RescueBroker : IDisposable
         try
         {
             IntPtr handle = _signalEvent.SafeWaitHandle.DangerousGetHandle();
-            return handle != IntPtr.Zero && Native.SetEvent(handle);
+            bool published = handle != IntPtr.Zero && Native.SetEvent(handle);
+            if (!published) sequence = 0;
+            return published;
         }
         catch
         {
             // This method is called from a low-level keyboard callback. Do not
             // perform file I/O or wait on a logger lock on the capture edge.
+            sequence = 0;
             return false;
         }
     }

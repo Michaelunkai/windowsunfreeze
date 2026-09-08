@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.7**
+Version **1.4.8**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -125,7 +125,8 @@ application memory or process dumps.
   trigger/diagnostic logging is written only after that handoff, as is the tray acceptance log;
   optional sound and UI feedback are posted asynchronously after handoff, and individual
   pre-dispatch probe failures are isolated so they cannot cancel recovery. Evidence probes
-  run independently within their own deadlines.
+  run independently within their own deadlines, and a wait-boundary fault still closes the
+  batch while preserving the active-run fence until late workers drain.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|
