@@ -85,6 +85,8 @@ internal sealed class KeyboardHook : IDisposable
     private const int HOOK_RENEWAL_MS = 10000;
     private const int RESCUE_HOOK_HEARTBEAT_INTERVAL_MS = 500;
     private const int RESCUE_HOOK_RENEWAL_MS = 15000;
+    private const int HOOK_SUPERVISOR_INTERVAL_MS = 500;
+    private const int HOOK_SUPERVISOR_RETRY_MS = 1000;
     private const int DISPATCH_SLOT_COUNT = 32;
     private const int DEBOUNCE_SLOT_COUNT = 16;
     private const int EMERGENCY_WRITING = 3;
@@ -104,6 +106,7 @@ internal sealed class KeyboardHook : IDisposable
     private readonly RescueBroker _rescueBroker;
     private readonly bool _ownsRescueBroker;
     private Config _config;
+    private readonly object _threadGate = new();
     private readonly object _dispatchGate = new();
     // Capture/debounce state is touched by both independent hook callbacks and
     // the registered-hotkey message path. Fixed atomic slots keep config reloads
@@ -118,9 +121,12 @@ internal sealed class KeyboardHook : IDisposable
     private readonly ManualResetEventSlim _hookStopped = new(false);
     private readonly ManualResetEventSlim _rescueReady = new(false);
     private readonly ManualResetEventSlim _rescueStopped = new(false);
-    private readonly Thread _hookThread;
-    private readonly Thread _rescueThread;
+    private readonly ManualResetEventSlim _hookSupervisorStop = new(false);
+    private readonly ManualResetEventSlim _hookSupervisorStopped = new(false);
+    private Thread? _hookThread;
+    private Thread? _rescueThread;
     private readonly Thread _dispatchThread;
+    private readonly Thread _hookSupervisorThread;
 
     private RecoveryHotkeyBinding[] _bindings = Array.Empty<RecoveryHotkeyBinding>();
     private long _debounceTicks;
@@ -137,6 +143,8 @@ internal sealed class KeyboardHook : IDisposable
     private long _lastRescueCallbackTicks;
     private long _lastRescueInstallTicks;
     private long _lastHeartbeatTicks;
+    private long _lastHookSupervisorRepairTicks;
+    private long _lastRescueSupervisorRepairTicks;
     private long _captureCount;
     private CaptureBox? _lastCapture;
     private readonly Dictionary<int, RecoveryHotkeyBinding> _registeredFallbackHotkeys = new();
@@ -235,27 +243,23 @@ internal sealed class KeyboardHook : IDisposable
         SetHighPriority(_dispatchThread);
         _dispatchThread.Start();
 
-        _hookThread = new Thread(HookThreadMain)
-        {
-            IsBackground = true,
-            Name = "Thaw low-level keyboard hook"
-        };
-        SetHighPriority(_hookThread);
-        _hookThread.Start();
+        StartHookThreadIfNeeded(rescue: false, reason: "initial");
 
         if (!_hookReady.Wait(3000))
             Log.Error("Keyboard hook thread did not report readiness within 3 s");
 
-        _rescueThread = new Thread(RescueHookThreadMain)
-        {
-            IsBackground = true,
-            Name = "Thaw emergency keyboard hook"
-        };
-        SetHighPriority(_rescueThread);
-        _rescueThread.Start();
+        StartHookThreadIfNeeded(rescue: true, reason: "initial");
 
         if (!_rescueReady.Wait(3000))
             Log.Error("Emergency keyboard hook thread did not report readiness within 3 s");
+
+        _hookSupervisorThread = new Thread(HookSupervisorThreadMain)
+        {
+            IsBackground = true,
+            Name = "Thaw keyboard hook supervisor"
+        };
+        SetHighPriority(_hookSupervisorThread);
+        _hookSupervisorThread.Start();
 
         Log.Info($"Keyboard hook paths ready: primary={(IsInstalled ? "installed" : "NO hook")}, " +
                  $"emergency={(IsEmergencyInstalled ? "installed" : "NO hook")}, " +
@@ -323,13 +327,128 @@ internal sealed class KeyboardHook : IDisposable
         if (Volatile.Read(ref _disposed) != 0) return false;
         bool posted = false;
         int threadId = Volatile.Read(ref _hookThreadId);
+        StartHookThreadIfNeeded(rescue: false, reason: "requested");
         if (threadId != 0)
             posted |= PostThreadMessage((uint)threadId, WM_APP_REINSTALL, IntPtr.Zero, IntPtr.Zero);
 
+        StartHookThreadIfNeeded(rescue: true, reason: "requested");
         int rescueThreadId = Volatile.Read(ref _rescueThreadId);
         if (rescueThreadId != 0)
             posted |= PostThreadMessage((uint)rescueThreadId, WM_APP_RESCUE_REINSTALL, IntPtr.Zero, IntPtr.Zero);
         return posted;
+    }
+
+    /// <summary>
+    /// Restarts a hook message thread after an escaped message-loop/native failure.
+    /// Each hook normally repairs itself, but a dead thread cannot run its own
+    /// heartbeat; this supervisor is deliberately independent of both hook loops.
+    /// </summary>
+    private void HookSupervisorThreadMain()
+    {
+        try
+        {
+            while (Volatile.Read(ref _disposed) == 0)
+            {
+                try
+                {
+                    if (_hookSupervisorStop.Wait(HOOK_SUPERVISOR_INTERVAL_MS)) break;
+                }
+                catch (ObjectDisposedException) { break; }
+
+                if (Volatile.Read(ref _disposed) != 0) break;
+                EnsureHookPath(rescue: false);
+                EnsureHookPath(rescue: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Keyboard hook supervisor failed", ex);
+        }
+        finally
+        {
+            _hookSupervisorStopped.Set();
+        }
+    }
+
+    private void EnsureHookPath(bool rescue)
+    {
+        Thread? thread = rescue
+            ? Volatile.Read(ref _rescueThread)
+            : Volatile.Read(ref _hookThread);
+        bool alive = thread?.IsAlive == true;
+        bool installed = rescue ? IsEmergencyInstalled : IsInstalled;
+        if (!alive)
+        {
+            Log.Warn((rescue ? "Emergency" : "Primary") +
+                     " keyboard hook thread exited; restarting capture path");
+            StartHookThreadIfNeeded(rescue, "supervisor");
+            return;
+        }
+
+        if (installed) return;
+
+        ref long lastRepair = ref (rescue
+            ? ref _lastRescueSupervisorRepairTicks
+            : ref _lastHookSupervisorRepairTicks);
+        long now = Stopwatch.GetTimestamp();
+        long previous = Volatile.Read(ref lastRepair);
+        if (previous != 0 && now - previous < ToStopwatchTicks(HOOK_SUPERVISOR_RETRY_MS))
+            return;
+        Volatile.Write(ref lastRepair, now);
+
+        int threadId = rescue
+            ? Volatile.Read(ref _rescueThreadId)
+            : Volatile.Read(ref _hookThreadId);
+        uint message = rescue ? WM_APP_RESCUE_REINSTALL : WM_APP_REINSTALL;
+        if (threadId != 0 && !PostThreadMessage((uint)threadId, message, IntPtr.Zero, IntPtr.Zero))
+            Log.Debug((rescue ? "Emergency" : "Primary") +
+                      " keyboard hook supervisor reinstall post failed");
+    }
+
+    private void StartHookThreadIfNeeded(bool rescue, string reason)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        lock (_threadGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            Thread? existing = rescue ? _rescueThread : _hookThread;
+            if (existing?.IsAlive == true) return;
+
+            ThreadStart entry = rescue ? RescueHookThreadMain : HookThreadMain;
+            var replacement = new Thread(entry)
+            {
+                IsBackground = true,
+                Name = rescue ? "Thaw emergency keyboard hook" : "Thaw low-level keyboard hook",
+            };
+            SetHighPriority(replacement);
+            if (rescue) _rescueThread = replacement;
+            else _hookThread = replacement;
+
+            try
+            {
+                replacement.Start();
+                if (!string.Equals(reason, "initial", StringComparison.OrdinalIgnoreCase))
+                    Log.Info((rescue ? "Emergency" : "Primary") +
+                             " keyboard hook thread restarted (" + reason + ")");
+            }
+            catch (Exception ex)
+            {
+                if (rescue)
+                {
+                    if (ReferenceEquals(_rescueThread, replacement)) _rescueThread = null;
+                    _rescueReady.Set();
+                }
+                else
+                {
+                    if (ReferenceEquals(_hookThread, replacement)) _hookThread = null;
+                    _hookReady.Set();
+                }
+                Log.Error((rescue ? "Emergency" : "Primary") +
+                          " keyboard hook thread start failed", ex);
+            }
+        }
     }
 
     /// <summary>
@@ -463,7 +582,8 @@ internal sealed class KeyboardHook : IDisposable
             RemoveHook();
             _hookReady.Set();
             _hookStopped.Set();
-            Volatile.Write(ref _hookThreadId, 0);
+            if (ReferenceEquals(Volatile.Read(ref _hookThread), Thread.CurrentThread))
+                Volatile.Write(ref _hookThreadId, 0);
         }
     }
 
@@ -522,7 +642,8 @@ internal sealed class KeyboardHook : IDisposable
             RemoveRescueHook();
             _rescueReady.Set();
             _rescueStopped.Set();
-            Volatile.Write(ref _rescueThreadId, 0);
+            if (ReferenceEquals(Volatile.Read(ref _rescueThread), Thread.CurrentThread))
+                Volatile.Write(ref _rescueThreadId, 0);
         }
     }
 
@@ -1274,23 +1395,47 @@ internal sealed class KeyboardHook : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        // Stop the supervisor first. Once it has observed disposal it must not
+        // create a replacement while the owner is tearing the hook threads down.
+        try { _hookSupervisorStop.Set(); } catch { }
+        bool supervisorOwn = ReferenceEquals(Thread.CurrentThread, _hookSupervisorThread);
+        if (!supervisorOwn)
+        {
+            try { _hookSupervisorThread.Join(2000); } catch { }
+            try { _hookSupervisorStopped.Wait(2000); } catch { }
+        }
+        bool supervisorStopped = supervisorOwn ? false : !_hookSupervisorThread.IsAlive;
+
+        Thread? hookThread = Volatile.Read(ref _hookThread);
+        bool hookThreadOwn = ReferenceEquals(Thread.CurrentThread, hookThread);
         int hookThreadId = Volatile.Read(ref _hookThreadId);
-        if (Thread.CurrentThread != _hookThread)
+        if (!hookThreadOwn)
         {
             if (hookThreadId != 0)
                 _ = PostThreadMessage((uint)hookThreadId, WM_APP_STOP, IntPtr.Zero, IntPtr.Zero);
-            try { _hookThread.Join(2000); } catch { }
-            try { _hookStopped.Wait(2000); } catch { }
+            if (hookThread is not null)
+            {
+                try { hookThread.Join(2000); } catch { }
+                try { _hookStopped.Wait(2000); } catch { }
+            }
         }
+        bool hookStopped = !hookThreadOwn && (hookThread is null || !hookThread.IsAlive);
 
+        Thread? rescueThread = Volatile.Read(ref _rescueThread);
+        bool rescueThreadOwn = ReferenceEquals(Thread.CurrentThread, rescueThread);
         int rescueThreadId = Volatile.Read(ref _rescueThreadId);
-        if (Thread.CurrentThread != _rescueThread)
+        if (!rescueThreadOwn)
         {
             if (rescueThreadId != 0)
                 _ = PostThreadMessage((uint)rescueThreadId, WM_APP_RESCUE_STOP, IntPtr.Zero, IntPtr.Zero);
-            try { _rescueThread.Join(2000); } catch { }
-            try { _rescueStopped.Wait(2000); } catch { }
+            if (rescueThread is not null)
+            {
+                try { rescueThread.Join(2000); } catch { }
+                try { _rescueStopped.Wait(2000); } catch { }
+            }
         }
+        bool rescueStopped = !rescueThreadOwn && (rescueThread is null || !rescueThread.IsAlive);
 
         // Wake and join the pre-warmed dispatch worker. No callback can enqueue
         // after _disposed is published, and any queued slots are cleared there.
@@ -1300,10 +1445,6 @@ internal sealed class KeyboardHook : IDisposable
             try { _dispatchThread.Join(2000); } catch { }
         }
 
-        bool hookThreadOwn = Thread.CurrentThread == _hookThread;
-        bool hookStopped = !hookThreadOwn && _hookStopped.IsSet;
-        bool rescueThreadOwn = Thread.CurrentThread == _rescueThread;
-        bool rescueStopped = !rescueThreadOwn && _rescueStopped.IsSet;
         bool dispatchStopped = Thread.CurrentThread == _dispatchThread || !_dispatchThread.IsAlive;
 
         if (hookThreadOwn)
@@ -1315,6 +1456,9 @@ internal sealed class KeyboardHook : IDisposable
             RemoveRescueHook();
         else if (!rescueStopped)
             Log.Debug("Emergency keyboard hook thread did not stop within 2 s");
+
+        if (!supervisorStopped)
+            Log.Debug("Keyboard hook supervisor did not stop within 2 s");
 
         // Do not dispose a wait handle while its worker may still be inside WaitOne
         // or publishing its final state; preservation beats an eager cleanup race.
@@ -1331,6 +1475,11 @@ internal sealed class KeyboardHook : IDisposable
         {
             try { _rescueReady.Dispose(); } catch { }
             try { _rescueStopped.Dispose(); } catch { }
+        }
+        if (supervisorStopped)
+        {
+            try { _hookSupervisorStop.Dispose(); } catch { }
+            try { _hookSupervisorStopped.Dispose(); } catch { }
         }
         if (_ownsRescueBroker)
         {

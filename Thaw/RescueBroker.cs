@@ -42,6 +42,7 @@ public sealed class RescueBroker : IDisposable
     public const string EventNamePrefix = @"Local\Thaw.RescueBroker.";
 
     private readonly object _gate = new();
+    private readonly object _acknowledgementGate = new();
     private readonly EventWaitHandle? _signalEvent;
     private readonly EventWaitHandle? _acknowledgementEvent;
     private Thread? _listenerThread;
@@ -238,9 +239,7 @@ public sealed class RescueBroker : IDisposable
                 ? Interlocked.Read(ref _sequence)
                 : sequence;
             if (effectiveSequence <= 0) return false;
-            if (!TryReserveAcknowledgement(effectiveSequence)) return true;
-            IntPtr handle = _acknowledgementEvent.SafeWaitHandle.DangerousGetHandle();
-            return handle != IntPtr.Zero && Native.SetEvent(handle);
+            return TryPublishAcknowledgement(effectiveSequence);
         }
         catch (Exception ex)
         {
@@ -262,9 +261,7 @@ public sealed class RescueBroker : IDisposable
         {
             long sequence = Interlocked.Read(ref _sequence);
             if (sequence <= 0) return false;
-            if (!TryReserveAcknowledgement(sequence)) return true;
-            IntPtr handle = _acknowledgementEvent.SafeWaitHandle.DangerousGetHandle();
-            return handle != IntPtr.Zero && Native.SetEvent(handle);
+            return TryPublishAcknowledgement(sequence);
         }
         catch
         {
@@ -294,14 +291,25 @@ public sealed class RescueBroker : IDisposable
         catch (Exception ex) { Log.Debug("Rescue broker acknowledgement drain failed: " + ex.Message); }
     }
 
-    private bool TryReserveAcknowledgement(long sequence)
+    private bool TryPublishAcknowledgement(long sequence)
     {
-        while (true)
+        // Keep the short native publish and the sequence commit together. The
+        // old reserve-before-publish order could permanently suppress retries
+        // after a transient SetEvent/handle failure.
+        lock (_acknowledgementGate)
         {
-            long previous = Volatile.Read(ref _lastAcknowledgedSequence);
-            if (sequence <= previous) return false;
-            if (Interlocked.CompareExchange(ref _lastAcknowledgedSequence, sequence, previous) == previous)
+            if (Volatile.Read(ref _disposed) != 0 || _acknowledgementEvent is null)
+                return false;
+
+            if (sequence <= Volatile.Read(ref _lastAcknowledgedSequence))
                 return true;
+
+            IntPtr handle = _acknowledgementEvent.SafeWaitHandle.DangerousGetHandle();
+            if (handle == IntPtr.Zero || !Native.SetEvent(handle))
+                return false;
+
+            Volatile.Write(ref _lastAcknowledgedSequence, sequence);
+            return true;
         }
     }
 
@@ -396,7 +404,10 @@ public sealed class RescueBroker : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         try { _signalEvent?.Set(); } catch { }
-        try { _acknowledgementEvent?.Set(); } catch { }
+        lock (_acknowledgementGate)
+        {
+            try { _acknowledgementEvent?.Set(); } catch { }
+        }
 
         Thread? listener;
         lock (_gate) listener = _listenerThread;
@@ -406,7 +417,10 @@ public sealed class RescueBroker : IDisposable
         }
 
         try { _signalEvent?.Dispose(); } catch { }
-        try { _acknowledgementEvent?.Dispose(); } catch { }
+        lock (_acknowledgementGate)
+        {
+            try { _acknowledgementEvent?.Dispose(); } catch { }
+        }
         Volatile.Write(ref _listening, 0);
     }
 

@@ -283,7 +283,9 @@ via `SynchronizationContext.Post` right after explorer comes back.
 
 ## Watchdog — how "stressed / frozen" is detected
 
-`Watchdog.cs`, a Highest-priority background thread sampling every 1 s:
+`Watchdog.cs`, a Highest-priority background thread sampling every 1 s. A single
+native/probe exception is rate-limited in the log and isolated to that sample so the
+detector continues on the next interval:
 
 1. **Scheduling delay (the freeze detector).** `Environment.TickCount64` before/after
    `Thread.Sleep(1000)`. If the machine froze, the thread wakes late:
@@ -342,10 +344,11 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
 
-1. **Two independent low-level hooks** — the primary and emergency `WH_KEYBOARD_LL` hooks
-   use separate native message-loop threads. Each has its own handle, heartbeat, and bounded
-   reinstall path; the newer hook gets the first opportunity while the primary remains a
-   fallback.
+1. **Two independent low-level hooks plus a supervisor** — the primary and emergency
+   `WH_KEYBOARD_LL` hooks use separate native message-loop threads. Each has its own handle,
+   heartbeat, and bounded reinstall path; an independent supervisor recreates a hook thread
+   if its message loop exits, while the newer hook gets the first opportunity and the primary
+   remains a fallback.
 2. **Lock-free callback edge** — callbacks use per-hook key state, atomic configuration
    references, a concurrent debounce table, and no synchronous file logging or recovery work.
    Callback faults are counted and passed through to Windows.
@@ -355,8 +358,9 @@ single hook does not erase the user's emergency request:
    paths, the dropped count is surfaced instead of hiding the loss.
 4. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
    event and the dispatch worker pulses a paired acknowledgement event only after it has
-   delivered the request. Sequence gating prevents duplicate acknowledgements from leaving
-   stale fallback pulses.
+   delivered the request. Sequence gating is committed only after the native pulse succeeds,
+   so a transient event-handle failure remains retryable and duplicate acknowledgements do not
+   leave stale fallback pulses.
 5. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
    `RegisterHotKey` registrations for always-on panic/frame-drop chords. If the main process
    does not acknowledge a request within the bounded window, it starts one headless,

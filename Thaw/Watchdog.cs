@@ -78,6 +78,7 @@ internal sealed class Watchdog : IDisposable
 
     private long _prevIdle, _prevKernel, _prevUser;
     private int _healthySamples;
+    private long _lastSampleErrorTick;
 
     // Pressure latches avoid treating one busy second as sustained pressure.
     private int _cpuHotSamples;
@@ -216,84 +217,116 @@ internal sealed class Watchdog : IDisposable
 
     private void Loop()
     {
-        bool haveTimes = Native.GetSystemTimes(out long idle, out long kernel, out long user);
+        bool haveTimes;
+        long idle;
+        long kernel;
+        long user;
+        try
+        {
+            haveTimes = Native.GetSystemTimes(out idle, out kernel, out user);
+        }
+        catch (Exception ex)
+        {
+            haveTimes = false;
+            idle = kernel = user = 0;
+            LogSampleFailure(ex);
+        }
         if (!haveTimes) idle = kernel = user = 0;
         _prevIdle = idle; _prevKernel = kernel; _prevUser = user;
 
         while (!_stop)
         {
-            long t0 = Environment.TickCount64;
-            Thread.Sleep(SamplePeriodMs);
-            if (_stop) break;
-
-            long now = Environment.TickCount64;
-            long wallMs = Math.Max(0, now - t0);
-            long delayMs = Math.Max(0, wallMs - SamplePeriodMs);
-
-            // CPU % (GetSystemTimes includes idle time in kernel time).
-            bool cpuSampleValid = false;
-            if (Native.GetSystemTimes(out long idle2, out long kernel2, out long user2))
+            try
             {
-                long idleD = idle2 - _prevIdle;
-                long kernD = kernel2 - _prevKernel;
-                long userD = user2 - _prevUser;
-                long total = kernD + userD;
-                if (total > 0 && idleD >= 0 && idleD <= total && kernD >= 0 && userD >= 0)
+                long t0 = Environment.TickCount64;
+                Thread.Sleep(SamplePeriodMs);
+                if (_stop) break;
+
+                long now = Environment.TickCount64;
+                long wallMs = Math.Max(0, now - t0);
+                long delayMs = Math.Max(0, wallMs - SamplePeriodMs);
+
+                // CPU % (GetSystemTimes includes idle time in kernel time).
+                bool cpuSampleValid = false;
+                if (Native.GetSystemTimes(out long idle2, out long kernel2, out long user2))
                 {
-                    Volatile.Write(ref _cpuPercent,
-                        Math.Clamp(100.0 * (1.0 - (double)idleD / total), 0, 100));
-                    cpuSampleValid = true;
+                    long idleD = idle2 - _prevIdle;
+                    long kernD = kernel2 - _prevKernel;
+                    long userD = user2 - _prevUser;
+                    long total = kernD + userD;
+                    if (total > 0 && idleD >= 0 && idleD <= total && kernD >= 0 && userD >= 0)
+                    {
+                        Volatile.Write(ref _cpuPercent,
+                            Math.Clamp(100.0 * (1.0 - (double)idleD / total), 0, 100));
+                        cpuSampleValid = true;
+                    }
+
+                    _prevIdle = idle2; _prevKernel = kernel2; _prevUser = user2;
                 }
 
-                _prevIdle = idle2; _prevKernel = kernel2; _prevUser = user2;
+                // RAM % (GlobalMemoryStatusEx is cheap; keep the last value on a failed sample).
+                var mem = Native.GetMemoryStatus();
+                bool memorySampleValid = mem.dwMemoryLoad is >= 1 and <= 100;
+                if (memorySampleValid) Volatile.Write(ref _memPercent, mem.dwMemoryLoad);
+
+                Volatile.Write(ref _cpuSampleValid, cpuSampleValid);
+                Volatile.Write(ref _memorySampleValid, memorySampleValid);
+
+                // This is a lock-free handoff. Optional PDH/process/network
+                // probes run on Telemetry's lower-priority worker and therefore
+                // cannot delay the existing watchdog or hard-stall gate.
+                _telemetry.PublishWatchdogSample(
+                    now,
+                    delayMs,
+                    Volatile.Read(ref _cpuPercent),
+                    Volatile.Read(ref _memPercent),
+                    cpuSampleValid,
+                    memorySampleValid);
+
+                Volatile.Write(ref _lastStallMs, delayMs);
+                if (delayMs > StallRecordThresholdMs)
+                    Volatile.Write(ref _lastStallAtTick, now);
+
+                bool hardStall = delayMs >= HardStallThresholdMs;
+                UpdateHealth(
+                    delayMs,
+                    Volatile.Read(ref _cpuPercent),
+                    Volatile.Read(ref _memPercent),
+                    cpuSampleValid,
+                    memorySampleValid,
+                    hardStall);
+
+                bool claimHardStall = TryClaimHardStall(now, delayMs, hardStall);
+                if (claimHardStall && !_stop)
+                {
+                    try { _telemetry.BeginIncident("hard stall"); }
+                    catch (Exception ex) { Log.Debug("Telemetry incident start unavailable: " + ex.Message); }
+                    Log.Warn($"HARD STALL detected: {delayMs} ms — auto-unfreeze (one-shot; cooldown {HardStallCooldownMs / 1000}s)");
+                    try { HardStallDetected?.Invoke(); }
+                    catch (Exception ex) { Log.Error("HardStall handler error", ex); }
+                }
+
+                // Small breather after a claimed or suppressed hard stall so the
+                // recovery path can make progress; the gate prevents repeat events.
+                if (hardStall) Thread.Sleep(HardStallBreatherMs);
             }
-
-            // RAM % (GlobalMemoryStatusEx is cheap; keep the last value on a failed sample).
-            var mem = Native.GetMemoryStatus();
-            bool memorySampleValid = mem.dwMemoryLoad is >= 1 and <= 100;
-            if (memorySampleValid) Volatile.Write(ref _memPercent, mem.dwMemoryLoad);
-
-            Volatile.Write(ref _cpuSampleValid, cpuSampleValid);
-            Volatile.Write(ref _memorySampleValid, memorySampleValid);
-
-            // This is a lock-free handoff. Optional PDH/process/network
-            // probes run on Telemetry's lower-priority worker and therefore
-            // cannot delay the existing watchdog or hard-stall gate.
-            _telemetry.PublishWatchdogSample(
-                now,
-                delayMs,
-                Volatile.Read(ref _cpuPercent),
-                Volatile.Read(ref _memPercent),
-                cpuSampleValid,
-                memorySampleValid);
-
-            Volatile.Write(ref _lastStallMs, delayMs);
-            if (delayMs > StallRecordThresholdMs)
-                Volatile.Write(ref _lastStallAtTick, now);
-
-            bool hardStall = delayMs >= HardStallThresholdMs;
-            UpdateHealth(
-                delayMs,
-                Volatile.Read(ref _cpuPercent),
-                Volatile.Read(ref _memPercent),
-                cpuSampleValid,
-                memorySampleValid,
-                hardStall);
-
-            bool claimHardStall = TryClaimHardStall(now, delayMs, hardStall);
-            if (claimHardStall && !_stop)
+            catch (Exception ex)
             {
-                try { _telemetry.BeginIncident("hard stall"); }
-                catch (Exception ex) { Log.Debug("Telemetry incident start unavailable: " + ex.Message); }
-                Log.Warn($"HARD STALL detected: {delayMs} ms — auto-unfreeze (one-shot; cooldown {HardStallCooldownMs / 1000}s)");
-                try { HardStallDetected?.Invoke(); }
-                catch (Exception ex) { Log.Error("HardStall handler error", ex); }
+                // A single native/probe failure must not terminate the only
+                // automatic-stall detector. Preserve the last valid sample and
+                // retry on the next bounded interval.
+                LogSampleFailure(ex);
             }
-
-            // Small breather after a claimed or suppressed hard stall so the
-            // recovery path can make progress; the gate prevents repeat events.
-            if (hardStall) Thread.Sleep(HardStallBreatherMs);
         }
+    }
+
+    private void LogSampleFailure(Exception ex)
+    {
+        long now = Environment.TickCount64;
+        long previous = Interlocked.Read(ref _lastSampleErrorTick);
+        if (previous != 0 && now - previous < 10_000) return;
+        Interlocked.Exchange(ref _lastSampleErrorTick, now);
+        Log.Error("Watchdog sample failed; monitoring continues", ex);
     }
 
     private void UpdateHealth(

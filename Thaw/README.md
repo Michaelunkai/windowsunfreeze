@@ -83,10 +83,11 @@ application memory or process dumps.
   The panic hotkey is always intercepted. A hook callback is not proof that recovery
   completed; check the log and the tray result.
 - **Hook resilience** — the hook owns a dedicated highest-priority native message thread,
-  a 250 ms heartbeat, bounded automatic reinstall, a preallocated dispatch ring, and a
+  250/500 ms heartbeats, bounded automatic reinstall, a preallocated dispatch ring, and a
   per-user rescue event so WinForms work cannot delay Alt+F4 capture. Version 1.4 adds a
   second independent low-level hook, lock-free callback capture, a reserved emergency
-  dispatch slot, and callback/drop counters for the rare saturated path.
+  dispatch slot, callback/drop counters for the rare saturated path, and an independent
+  supervisor that recreates a hook thread if its native message loop ever exits.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic and
   frame-drop chords with `RegisterHotKey`; if the main process does not acknowledge a
@@ -94,7 +95,8 @@ application memory or process dumps.
   fallback, not a second normal recovery loop, and it never runs arbitrary commands.
 - **Watchdog** (`Watchdog.cs`) — samples scheduling delay, CPU, and RAM each second.
   It drives the alert icon and can request automatic recovery after a hard stall when
-  `AutoUnfreezeOnStall` is enabled. Keep automatic recovery off until you have
+  `AutoUnfreezeOnStall` is enabled. A failed native/probe sample is isolated and retried
+  instead of terminating the detector. Keep automatic recovery off until you have
   reviewed the configured actions; a watchdog trigger is not a diagnosis.
 - **Telemetry and verification** — a bounded one-Hz ring records scheduler, CPU, RAM,
   commit, disk, DPC/ISR, network, GPU-engine, QoS, foreground-process, and real DWM
