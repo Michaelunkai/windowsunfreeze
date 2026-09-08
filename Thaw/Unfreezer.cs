@@ -367,7 +367,6 @@ internal sealed class Unfreezer : IDisposable
     /// </summary>
     private void Run(TriggerReason reason)
     {
-        Log.Info($"Unfreeze triggered ({reason})");
         try { _watchdog.CaptureTelemetryBefore(reason.ToString()); }
         catch (Exception ex) { Log.Debug("Pre-recovery telemetry capture unavailable: " + ex.Message); }
         var sw = Stopwatch.StartNew();
@@ -473,12 +472,6 @@ internal sealed class Unfreezer : IDisposable
                 reason, cause, forceAll, memoryPressure, counters.ForegroundHung,
                 counters.DwmHung, counters.ExplorerHung);
 
-            Log.Info($"Recovery diagnostics: reason={reason}, cause={primaryCause}, budget={RecoveryBudgetMs} ms, " +
-                     $"elevated={Native.IsElevated()}, fg={foregroundPid}/{counters.ForegroundName}, " +
-                     $"fgHung={counters.ForegroundHung}, dwmHung={counters.DwmHung}, explorerHung={counters.ExplorerHung}, " +
-                     $"stall={_watchdog.LastStallMs} ms, cpu={_watchdog.CpuPercent:0}%, ram={memoryBefore.dwMemoryLoad}%, " +
-                     $"memory={memoryReason}, forceAll={forceAll}, selected={string.Join("|", selected)}");
-
             RecoveryProbe Probe() => RecoveryCoordinator.Probe(_watchdog, () => IsForegroundHung(foregroundPid));
 
             // Queue every selected action in one coordinator call.  The call only
@@ -491,6 +484,15 @@ internal sealed class Unfreezer : IDisposable
             long dispatchStarted = Environment.TickCount64;
             dispatch = _coordinator.Dispatch(runId, reason, cause, forceAll, deadline, journal, actions);
             long dispatchMs = Environment.TickCount64 - dispatchStarted;
+            // Log only after the coordinator has signalled the pre-warmed action
+            // workers. File I/O or a locked log must never precede first recovery
+            // mutations on the force-all shortcut path.
+            Log.Info($"Unfreeze triggered ({reason})");
+            Log.Info($"Recovery diagnostics: reason={reason}, cause={primaryCause}, budget={RecoveryBudgetMs} ms, " +
+                     $"elevated={Native.IsElevated()}, fg={foregroundPid}/{counters.ForegroundName}, " +
+                     $"fgHung={counters.ForegroundHung}, dwmHung={counters.DwmHung}, explorerHung={counters.ExplorerHung}, " +
+                     $"stall={_watchdog.LastStallMs} ms, cpu={_watchdog.CpuPercent:0}%, ram={memoryBefore.dwMemoryLoad}%, " +
+                     $"memory={memoryReason}, forceAll={forceAll}, selected={string.Join("|", selected)}");
             if (forceAll && dispatchMs >= RecoveryCoordinator.ForceAllDispatchDeadlineMs)
                 Log.Warn($"Alt+F4 force-all dispatch exceeded {RecoveryCoordinator.ForceAllDispatchDeadlineMs} ms: {dispatchMs} ms");
             else if (forceAll)
