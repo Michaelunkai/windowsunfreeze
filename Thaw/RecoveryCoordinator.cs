@@ -562,9 +562,34 @@ internal sealed class RecoveryCoordinator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Closes a batch when its owner fails before reaching the normal wait
+    /// boundary. Queued actions are then observed as skipped and the coordinator
+    /// reservation is released only after any already-running action drains.
+    /// </summary>
+    internal void Abort(RecoveryDispatch dispatch)
+    {
+        ArgumentNullException.ThrowIfNull(dispatch);
+        try
+        {
+            // Use the same queue gate as WorkerLoop so a queued action cannot
+            // slip past the close after the owner has abandoned the batch.
+            lock (_gate) dispatch.Close();
+            try { _workAvailable.Set(); } catch { }
+            FinishDispatch(dispatch);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Failed to abort recovery dispatch", ex);
+            Interlocked.Exchange(ref _activeDispatch, 0);
+        }
+    }
+
     private void FinishDispatch(RecoveryDispatch dispatch)
     {
-        dispatch.Close();
+        // Closing under the queue gate makes the abort and normal wait paths
+        // share one ordering guarantee with WorkerLoop's dequeue operation.
+        lock (_gate) dispatch.Close();
         if (dispatch.IsDrained)
         {
             Interlocked.Exchange(ref _activeDispatch, 0);

@@ -551,11 +551,20 @@ internal static class Program
             if (!completed.Wait(Unfreezer.RecoveryBudgetMs + 5_000))
             {
                 Console.Error.WriteLine("Thaw rescue fallback: bounded recovery did not report completion.");
-                return 4;
+                // A full-engine worker can still be stranded by an OS/native
+                // boundary even though its own action deadlines have elapsed.
+                // Do not let that terminal wait become the end of rescue: submit
+                // the allocation-light graphics reset before the helper exits.
+                return RunMinimalRescueFallback("full recovery completion timeout");
             }
 
-            Console.WriteLine("Thaw rescue fallback: " + (result?.Summary ?? "completed without a receipt"));
-            return result?.OverallOutcome == RecoveryOutcome.Worse ? 5 : 0;
+            if (result is null)
+                return RunMinimalRescueFallback("full recovery returned no receipt");
+
+            Console.WriteLine("Thaw rescue fallback: " + result.Summary);
+            if (result.OverallOutcome == RecoveryOutcome.Worse)
+                return RunMinimalRescueFallback("full recovery reported measured degradation");
+            return 0;
         }
         catch (Exception ex)
         {

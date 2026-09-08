@@ -465,6 +465,20 @@ single hook does not erase the user's emergency request:
 27. **Pre-sized hook key state** — both independent low-level hooks reserve pressed-key capacity at
     startup, removing first-use collection growth from the callback path while Windows is waiting for
     its hook decision.
+28. **Rescue completion-timeout escape hatch** — if the out-of-process headless force-all fallback
+    cannot publish a terminal receipt within its bounded wait, or reports measured degradation, it
+    submits the allocation-light graphics reset before exiting instead of silently ending rescue with
+    no final display attempt.
+29. **Handoff-gated rescue acknowledgement** — the main process acknowledges a captured rescue
+    signal only after the recovery owner confirms that the request entered its pre-warmed handoff.
+    A subscriber failure or genuine worker-start/queue failure therefore leaves the helper free to
+    execute its independent bounded fallback; deliberate overlap handling is described next.
+30. **Explicit rescue disposition** — an already-running recovery or deliberate cooldown is
+    reported as intentionally covered, so it cannot spawn a duplicate force-all process, while a
+    genuine queue/handoff failure remains unacknowledged and still escalates through the helper.
+31. **Pre-wait dispatch abort** — if the recovery owner fails after queuing a batch but before
+    reaching its normal bounded wait, the coordinator closes that batch under the queue gate,
+    wakes workers to skip queued actions, and preserves the drain fence until late actions leave.
 
 These are still user-mode recovery paths. If Windows cannot schedule either process, the
 input stack, kernel, power source, or hardware has failed, no executable can react.

@@ -245,6 +245,13 @@ internal sealed class Unfreezer : IDisposable
     /// </summary>
     public bool RecoveryWorkerAlive => Volatile.Read(ref _recoveryWorker)?.IsAlive == true;
 
+    /// <summary>
+    /// True while an existing recovery run or late coordinator action is still
+    /// covering the system. The UI uses this to avoid spawning a duplicate
+    /// out-of-process force-all rescue for an intentionally overlapping chord.
+    /// </summary>
+    internal bool IsRecoveryBusy => Volatile.Read(ref _active) != 0 || _coordinator.IsBusy;
+
     private bool QueueRecoveryRequest()
     {
         for (int attempt = 0; attempt < 2; attempt++)
@@ -437,6 +444,7 @@ internal sealed class Unfreezer : IDisposable
         ulong availableBefore = 0;
         string primaryCause = "unknown";
         RecoveryDispatch? dispatch = null;
+        bool dispatchFinalized = false;
         Guid runId = Guid.NewGuid();
 
         void CaptureReceipt(RecoveryProgressReceipt receipt)
@@ -581,7 +589,18 @@ internal sealed class Unfreezer : IDisposable
 
             // Let all independent actions run while the owner thread performs
             // only bounded waiting.  No action is allowed to consume this thread.
-            bool complete = _coordinator.Wait(dispatch, deadline);
+            bool complete;
+            try
+            {
+                complete = _coordinator.Wait(dispatch, deadline);
+            }
+            finally
+            {
+                // RecoveryCoordinator.Wait owns its own finally boundary. This
+                // flag tells the outer failure path that the reservation is
+                // already closed if the wait itself throws.
+                dispatchFinalized = true;
+            }
             if (!complete) counters.BudgetExpired = true;
 
             IReadOnlyList<RecoveryProgressReceipt> batchReceipts = dispatch.Receipts;
@@ -655,6 +674,12 @@ internal sealed class Unfreezer : IDisposable
         catch (Exception ex)
         {
             Log.Error("Unfreeze failed", ex);
+            if (dispatch is not null && !dispatchFinalized)
+            {
+                try { _coordinator.Abort(dispatch); }
+                catch (Exception abortEx) { Log.Error("Unfreeze dispatch abort failed", abortEx); }
+                dispatchFinalized = true;
+            }
             try { journal.RollbackAll(); } catch { }
             try
             {

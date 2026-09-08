@@ -26,6 +26,21 @@ internal sealed class RecoveryHotkeyEventArgs : EventArgs
     public RecoveryHotkeyMode Mode { get; }
     public string SettingName { get; }
     public string Hotkey { get; }
+
+    /// <summary>
+    /// Set by the recovery owner after it has accepted this request into its
+    /// pre-warmed handoff. The rescue helper must not be acknowledged merely
+    /// because an event subscriber was invoked.
+    /// </summary>
+    internal bool HandoffAccepted { get; set; }
+
+    /// <summary>
+    /// Set when the recovery owner confirms that this request is either newly
+    /// handed off or deliberately covered by an existing recovery boundary.
+    /// This prevents an intentional duplicate from spawning a second force-all
+    /// process while still allowing a real handoff failure to escalate.
+    /// </summary>
+    internal bool RescueHandled { get; set; }
 }
 
 /// <summary>
@@ -1279,6 +1294,7 @@ internal sealed class KeyboardHook : IDisposable
         }
 
         bool delivered = false;
+        bool handoffAccepted = false;
         if (Volatile.Read(ref _disposed) == 0)
         {
             Delegate[]? subscribers = RecoveryActionRequested?.GetInvocationList();
@@ -1303,13 +1319,26 @@ internal sealed class KeyboardHook : IDisposable
 
             if (legacyCallback is not null)
             {
-                try { legacyCallback(); delivered = true; }
+                try
+                {
+                    legacyCallback();
+                    delivered = true;
+                    // Compatibility-only instances have no typed recovery owner
+                    // to mark the handoff. Their legacy callback is the owner.
+                    if (subscribers is null) handoffAccepted = true;
+                }
                 catch (Exception ex) { Log.Error("Legacy hotkey callback failed", ex); }
             }
 
-            // Acknowledge only after a live dispatch worker has delivered the
-            // request. Queue insertion alone is not proof that recovery can run.
-            if (delivered && slot.RescueSequence > 0)
+            // Read the owner marks after all subscribers have run. The
+            // properties are intentionally set by the recovery subscriber
+            // during delivery.
+            handoffAccepted |= args.HandoffAccepted || args.RescueHandled;
+
+            // Acknowledge only after the recovery owner confirms a new handoff
+            // or deliberately marks the request as already covered. Event
+            // invocation alone is not proof: a worker failure can reject it.
+            if (delivered && handoffAccepted && slot.RescueSequence > 0)
                 _ = _rescueBroker.TryAcknowledgeFast(slot.RescueSequence);
         }
 

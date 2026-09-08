@@ -43,6 +43,13 @@ internal sealed class AppContext : ApplicationContext
     private const long RecoveryWatchdogTimeoutMs = 60_000;
     private const long ShellRecoveryCooldownMs = 6000;
     private const long ShellRecoveryWatchdogTimeoutMs = 30_000;
+
+    private enum RescueHandoffResult
+    {
+        Failed,
+        Accepted,
+        AlreadyCovered,
+    }
     private int _recoveryInProgress;
     private int _shellRecoveryInProgress;
     private long _lastRecoveryRequestTick = long.MinValue;
@@ -349,13 +356,13 @@ internal sealed class AppContext : ApplicationContext
     /// overlapping pass; this UI-side guard additionally makes repeated keys and
     /// tray clicks visible and keeps them from creating misleading duplicate work.
     /// </summary>
-    private void RequestUnfreeze(TriggerReason reason, bool bypassCooldown = false)
+    private RescueHandoffResult RequestUnfreeze(TriggerReason reason, bool bypassCooldown = false)
     {
         long now = Environment.TickCount64;
         if (Interlocked.CompareExchange(ref _recoveryInProgress, 1, 0) != 0)
         {
             Log.Debug($"Recovery request ({reason}) ignored: recovery already in progress");
-            return;
+            return RescueHandoffResult.AlreadyCovered;
         }
 
         long last = Interlocked.Read(ref _lastRecoveryRequestTick);
@@ -363,7 +370,7 @@ internal sealed class AppContext : ApplicationContext
         {
             Interlocked.Exchange(ref _recoveryInProgress, 0);
             Log.Debug($"Recovery request ({reason}) ignored: cooldown {RecoveryCooldownMs - (now - last)} ms remaining");
-            return;
+            return RescueHandoffResult.AlreadyCovered;
         }
 
         Interlocked.Exchange(ref _lastRecoveryRequestTick, now);
@@ -381,11 +388,11 @@ internal sealed class AppContext : ApplicationContext
             Interlocked.Exchange(ref _recoveryInProgress, 0);
             _lastRecoveryOutcome = "Recovery could not start; retry is available.";
             Log.Error($"Recovery request ({reason}) failed before handoff", ex);
-            return;
+            return RescueHandoffResult.Failed;
         }
         // The recovery worker is pre-warmed and must receive the request before
         // synchronous log I/O can contend with the shortcut handoff.
-        Log.Info($"Recovery requested ({reason}) — normal/cooldown guard accepted");
+        Log.Info($"Recovery requested ({reason}) — handoff={(accepted ? "accepted" : "deferred")}");
         if (!accepted)
         {
             // A previous action may still be draining after its owner deadline.
@@ -394,28 +401,28 @@ internal sealed class AppContext : ApplicationContext
             Interlocked.Exchange(ref _recoveryInProgress, 0);
             _lastRecoveryOutcome = "Recovery deferred while a previous bounded action drains.";
             Log.Debug($"Recovery request ({reason}) was deferred by the engine fence");
+            return _unfreezer.IsRecoveryBusy
+                ? RescueHandoffResult.AlreadyCovered
+                : RescueHandoffResult.Failed;
         }
+
+        return RescueHandoffResult.Accepted;
     }
 
     private void OnRecoveryHotkeyRequested(object? sender, RecoveryHotkeyEventArgs e)
     {
         // Handoff comes first. UI marshaling must never delay a captured shortcut
         // or prevent the pre-warmed recovery worker from receiving it.
-        switch (e.Action)
+        RescueHandoffResult result = e.Action switch
         {
-            case RecoveryHotkeyAction.Panic:
-                RequestUnfreeze(TriggerReason.Panic, bypassCooldown: true);
-                break;
-            case RecoveryHotkeyAction.Slowness:
-                RequestUnfreeze(TriggerReason.Slowness);
-                break;
-            case RecoveryHotkeyAction.FrameDrop:
-                RequestUnfreeze(TriggerReason.FrameDrop);
-                break;
-            case RecoveryHotkeyAction.AltF4:
-                RequestUnfreeze(TriggerReason.Hotkey);
-                break;
-        }
+            RecoveryHotkeyAction.Panic => RequestUnfreeze(TriggerReason.Panic, bypassCooldown: true),
+            RecoveryHotkeyAction.Slowness => RequestUnfreeze(TriggerReason.Slowness),
+            RecoveryHotkeyAction.FrameDrop => RequestUnfreeze(TriggerReason.FrameDrop),
+            RecoveryHotkeyAction.AltF4 => RequestUnfreeze(TriggerReason.Hotkey),
+            _ => RescueHandoffResult.Failed,
+        };
+        e.HandoffAccepted = result == RescueHandoffResult.Accepted;
+        e.RescueHandled = result != RescueHandoffResult.Failed;
 
         // This is only a capture acknowledgement, not proof that Windows accepted
         // every recovery operation. It is posted after the engine handoff.

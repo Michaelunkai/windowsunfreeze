@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.14**
+Version **1.4.17**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -101,8 +101,10 @@ application memory or process dumps.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic,
   frame-drop, and Alt+F4 (when `AltF4Mode` is `always`) chords with `RegisterHotKey`; the
-  main process keeps a matching in-process fallback as well. If the main process does not
-  acknowledge a capture, the helper starts one headless bounded force-all recovery—even when
+  main process keeps a matching in-process fallback as well. The main process acknowledges a
+  capture only after its recovery owner accepts the request into the pre-warmed handoff or confirms
+  that an existing recovery already covers it; a genuine handoff failure is not acknowledged, and
+  the helper starts one headless bounded force-all recovery—even when
   the main process has just crashed with a nonzero exit code. A clean parent exit is still
   ignored. This is an emergency fallback, not a second normal recovery loop, and it never runs
   arbitrary commands. Its registered-hotkey message loop re-registers after a recoverable
@@ -139,9 +141,9 @@ application memory or process dumps.
   request, it also publishes a terminal worker-boundary result so the tray and rescue helper do
   not wait for a completion event that can never arrive. Recovery worker prewarming tolerates a
   partial startup under resource pressure and reports an explicit terminal failure only when no
-  worker is available at all. If dispatch setup itself aborts after filling any slots, the batch
-  is closed under the queue gate and the coordinator keeps its active-run reservation until
-  already-running work drains.
+  worker is available at all. If dispatch setup itself aborts after filling any slots, or the run
+  fails after queuing but before its normal wait boundary, the batch is closed under the queue
+  gate and the coordinator keeps its active-run reservation until already-running work drains.
 
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|
@@ -254,7 +256,9 @@ configuration and confirm the log afterward. It is not a read-only test.
   arbitrary commands. The legacy watchdog is off by default. The Thaw-only rescue broker
   defaults to `relaunch` and monitors only the exact running `Thaw.exe` process. The rescue
   fallback performs one bounded force-all pass without creating a tray or acquiring the
-  normal single-instance mutex.
+  normal single-instance mutex. If that pass cannot publish completion or reports measured
+  degradation, the helper also submits the allocation-light graphics-reset escape hatch
+  before exiting.
 
 ## Logs
 
