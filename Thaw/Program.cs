@@ -338,6 +338,9 @@ internal static class Program
                     throw new InvalidOperationException("Alt+F4 does not enable every recovery tier");
                 if (!Unfreezer.IsForceAll(TriggerReason.Hotkey) || Unfreezer.IsForceAll(TriggerReason.Panic))
                     throw new InvalidOperationException("Alt+F4 is not the unique force-all trigger");
+                if (!Unfreezer.DefersExpensivePreDispatchProbes(TriggerReason.Hotkey) ||
+                    Unfreezer.DefersExpensivePreDispatchProbes(TriggerReason.Panic))
+                    throw new InvalidOperationException("force-all pre-dispatch probe deferral invariant failed");
                 if (Unfreezer.DisplayProbeDelayMs >= Unfreezer.AltF4ActivationDeadlineMs)
                     throw new InvalidOperationException("display activation barrier is not sub-second");
                 Console.WriteLine($"Self-test: PASS — Alt+F4 force-all enables every tier with a {Unfreezer.DisplayProbeDelayMs} ms display barrier");

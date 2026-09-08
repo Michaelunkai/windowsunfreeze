@@ -205,6 +205,8 @@ internal sealed class Unfreezer : IDisposable
 
     internal static bool IsForceAll(TriggerReason reason) => reason == TriggerReason.Hotkey;
 
+    internal static bool DefersExpensivePreDispatchProbes(TriggerReason reason) => IsForceAll(reason);
+
     public bool Trigger(TriggerReason reason)
     {
         if (!TryEnter())
@@ -439,14 +441,20 @@ internal sealed class Unfreezer : IDisposable
 
             Native.MEMORYSTATUSEX memoryBefore = Native.GetMemoryStatus();
             availableBefore = memoryBefore.ullAvailPhys;
+            bool forceAll = IsForceAll(reason);
+            bool deferExpensiveProbes = DefersExpensivePreDispatchProbes(reason);
             uint foregroundPid = Native.GetForegroundPid();
             counters.ForegroundPid = foregroundPid;
-            counters.ForegroundName = TryGetProcessName(foregroundPid);
-            counters.ForegroundHung = IsForegroundHung(foregroundPid);
-            counters.DwmHung = IsDwmHung();
-            counters.ExplorerHung = IsExplorerHung();
+            counters.ForegroundName = deferExpensiveProbes ? "deferred" : TryGetProcessName(foregroundPid);
+            // A force-all shortcut deliberately does not wait for the expensive
+            // responsiveness probes before queuing recovery. Its action graph
+            // already includes the display/shell paths, and the probes can be
+            // the very components that are stalled. Cause-directed requests keep
+            // the probes for their safer selection gates.
+            counters.ForegroundHung = !deferExpensiveProbes && IsForegroundHung(foregroundPid);
+            counters.DwmHung = !deferExpensiveProbes && IsDwmHung();
+            counters.ExplorerHung = !deferExpensiveProbes && IsExplorerHung();
             bool measuredMemoryPressure = IsMemoryPressure(memoryBefore, out string memoryReason);
-            bool forceAll = IsForceAll(reason);
             bool memoryPressure = measuredMemoryPressure || forceAll;
             if (forceAll)
                 memoryReason = $"force-all(load={memoryBefore.dwMemoryLoad}%, available={memoryBefore.ullAvailPhys / (1024 * 1024)} MB)";

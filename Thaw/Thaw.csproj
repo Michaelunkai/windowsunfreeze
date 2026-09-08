@@ -9,7 +9,7 @@
     <RootNamespace>Thaw</RootNamespace>
     <AssemblyName>Thaw</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.4.3</Version>
+    <Version>1.4.4</Version>
     <Product>Thaw</Product>
     <AssemblyTitle>Thaw — Instant Unfreezer</AssemblyTitle>
     <Description>Breaks system freezes and restores full performance without closing a single app.</Description>
