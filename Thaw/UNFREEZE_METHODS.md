@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.5)
+## Capture-path hardening (1.4.6)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -392,9 +392,10 @@ single hook does not erase the user's emergency request:
    failed handoff is released so a later shortcut can retry.
 8. **Force-all fast path** — Alt+F4 determines its force-all profile before foreground,
    DWM, Explorer, or foreground-name probes that may themselves be stalled. It queues the
-   complete recovery graph first; synchronous trigger/diagnostic logging is also deferred
-   until after that handoff, and evidence collection runs in independently bounded action
-   workers, so a diagnostic or log-volume delay cannot postpone the first recovery mutations.
+   complete recovery graph first; synchronous engine and tray acceptance/diagnostic logging
+   is also deferred until after that handoff. Optional sound/UI feedback is posted
+   asynchronously, and evidence collection runs in independently bounded action workers, so
+   a diagnostic, log-volume, audio, or UI delay cannot postpone the first recovery mutations.
 9. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.

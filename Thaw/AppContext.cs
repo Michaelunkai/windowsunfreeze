@@ -355,8 +355,11 @@ internal sealed class AppContext : ApplicationContext
 
         Interlocked.Exchange(ref _lastRecoveryRequestTick, now);
         Volatile.Write(ref _lastRecoveryReason, (int)reason);
+        bool accepted = _unfreezer.Trigger(reason);
+        // The recovery worker is pre-warmed and must receive the request before
+        // synchronous log I/O can contend with the shortcut handoff.
         Log.Info($"Recovery requested ({reason}) — normal/cooldown guard accepted");
-        if (!_unfreezer.Trigger(reason))
+        if (!accepted)
         {
             // A previous action may still be draining after its owner deadline.
             // Do not leave the UI guard claiming a recovery is in progress when
@@ -407,19 +410,21 @@ internal sealed class AppContext : ApplicationContext
             _ => "Recovery captured — starting",
         };
 
-        if (_config.PlayRecoverySound)
-        {
-            try { SystemSounds.Asterisk.Play(); }
-            catch (Exception ex) { Log.Debug("Recovery sound unavailable: " + ex.Message); }
-        }
-
+        bool playSound = _config.PlayRecoverySound;
+        bool showBalloon = _config.ShowImmediateCaptureFeedback && _config.ShowBalloons;
+        bool showOverlay = _config.ShowCaptureOverlay;
         _ui.Post(_ =>
         {
             try
             {
-                if (_config.ShowImmediateCaptureFeedback && _config.ShowBalloons)
+                if (playSound)
+                {
+                    try { SystemSounds.Asterisk.Play(); }
+                    catch (Exception ex) { Log.Debug("Recovery sound unavailable: " + ex.Message); }
+                }
+                if (showBalloon)
                     _tray.ShowBalloonTip(1500, "Thaw", label, ToolTipIcon.Info);
-                if (_config.ShowCaptureOverlay)
+                if (showOverlay)
                     ShowCaptureOverlay(label);
             }
             catch (Exception ex)
