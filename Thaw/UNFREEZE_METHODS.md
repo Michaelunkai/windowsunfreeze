@@ -349,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.1)
+## Capture-path hardening (1.4.2)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -373,16 +373,18 @@ single hook does not erase the user's emergency request:
    a time, so one throwing consumer cannot prevent later consumers from running.
 5. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
    event and the dispatch worker pulses a paired acknowledgement event only after it has
-   delivered the request. Sequence gating is committed only after the native pulse succeeds,
-   so a transient event-handle failure remains retryable and duplicate acknowledgements do not
-   leave stale fallback pulses.
+   delivered the request. The exact signal sequence travels with each pre-warmed dispatch
+   slot, so an earlier queued request cannot acknowledge a later one. Sequence gating is
+   committed only after the native pulse succeeds, so a transient event-handle failure remains
+   retryable and duplicate acknowledgements do not leave stale fallback pulses.
 6. **In-process and out-of-process registered-hotkey fallback** — the main hook thread and
    the Thaw-only rescue helper register always-on panic/frame-drop chords, plus Alt+F4 when
    `AltF4Mode` is `always`. If the main process does not acknowledge a request within the
    bounded window, the helper starts one headless, force-all recovery. Both registrations
    re-register after recoverable message-loop failures; the helper also refreshes them after
-   a live config change. RegisterHotKey is a recovery wake-up fallback, not a promise of
-   Alt+F4 close suppression.
+   a live config change. Rejected registrations are retried, healthy registrations are
+   periodically renewed, and the parent monitor recreates the helper thread if it exits.
+   RegisterHotKey is a recovery wake-up fallback, not a promise of Alt+F4 close suppression.
 7. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.

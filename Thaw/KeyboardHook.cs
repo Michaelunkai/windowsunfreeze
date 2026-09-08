@@ -87,6 +87,8 @@ internal sealed class KeyboardHook : IDisposable
     private const int RESCUE_HOOK_RENEWAL_MS = 5000;
     private const int HOOK_SUPERVISOR_INTERVAL_MS = 500;
     private const int HOOK_SUPERVISOR_RETRY_MS = 1000;
+    private const int FALLBACK_HOTKEY_RETRY_MS = 1000;
+    private const int FALLBACK_HOTKEY_RENEWAL_MS = 30_000;
     private const int DISPATCH_SLOT_COUNT = 32;
     private const int DEBOUNCE_SLOT_COUNT = 16;
     private const int EMERGENCY_WRITING = 3;
@@ -148,6 +150,7 @@ internal sealed class KeyboardHook : IDisposable
     private long _lastHeartbeatTicks;
     private long _lastHookSupervisorRepairTicks;
     private long _lastRescueSupervisorRepairTicks;
+    private long _lastFallbackHotkeyRefreshTicks;
     private long _captureCount;
     private CaptureBox? _lastCapture;
     private readonly Dictionary<int, RecoveryHotkeyBinding> _registeredFallbackHotkeys = new();
@@ -791,8 +794,8 @@ internal sealed class KeyboardHook : IDisposable
                                 var args = new RecoveryHotkeyEventArgs(
                                     RecoveryHotkeyAction.AltF4, mode,
                                     nameof(Config.AltF4Mode), "Alt+F4");
-                                RecordCapture(args);
-                                QueueAction(args, _onAltF4Intercepted);
+                                long rescueSequence = RecordCapture(args);
+                                QueueAction(args, _onAltF4Intercepted, rescueSequence);
                             }
                         }
                         return (IntPtr)1;
@@ -809,11 +812,11 @@ internal sealed class KeyboardHook : IDisposable
                         if (!repeat && TryAccept(binding.Chord.Signature, repeat))
                         {
                             var args = new RecoveryHotkeyEventArgs(binding);
-                            RecordCapture(args);
+                            long rescueSequence = RecordCapture(args);
                             Action? legacy = binding.Action == RecoveryHotkeyAction.Panic
                                 ? _onPanic
                                 : _onAltF4Intercepted;
-                            QueueAction(args, legacy);
+                            QueueAction(args, legacy, rescueSequence);
                         }
                         return (IntPtr)1;
                     }
@@ -925,6 +928,7 @@ internal sealed class KeyboardHook : IDisposable
         }
 
         Volatile.Write(ref _registeredFallbackHotkeyCount, _registeredFallbackHotkeys.Count);
+        Volatile.Write(ref _lastFallbackHotkeyRefreshTicks, Stopwatch.GetTimestamp());
     }
 
     private void UnregisterFallbackHotkeys()
@@ -947,11 +951,11 @@ internal sealed class KeyboardHook : IDisposable
             return;
 
         var args = new RecoveryHotkeyEventArgs(binding);
-        RecordCapture(args);
+        long rescueSequence = RecordCapture(args);
         Action? legacy = binding.Action == RecoveryHotkeyAction.Panic
             ? _onPanic
             : _onAltF4Intercepted;
-        QueueAction(args, legacy);
+        QueueAction(args, legacy, rescueSequence);
         Log.Debug($"RegisterHotKey fallback captured {binding.Chord.Text}");
     }
 
@@ -1003,6 +1007,23 @@ internal sealed class KeyboardHook : IDisposable
         if (!IsInstalled || _handle == IntPtr.Zero ||
             (callbackAge >= staleTicks && activeInput) || installAge >= renewalTicks)
             InstallHook("heartbeat");
+
+        MaintainFallbackHotkeys(now);
+    }
+
+    private void MaintainFallbackHotkeys(long now)
+    {
+        Config config = Volatile.Read(ref _config);
+        int expected = config.GetAlwaysFallbackHotkeys().Count;
+        int actual = RegisteredFallbackHotkeyCount;
+        long previous = Volatile.Read(ref _lastFallbackHotkeyRefreshTicks);
+        long retryTicks = ToStopwatchTicks(FALLBACK_HOTKEY_RETRY_MS);
+        long renewalTicks = ToStopwatchTicks(FALLBACK_HOTKEY_RENEWAL_MS);
+        if (previous != 0 && now - previous < retryTicks) return;
+        if (actual == expected && previous != 0 && now - previous < renewalTicks) return;
+
+        RegisterFallbackHotkeys("health check");
+        Volatile.Write(ref _lastFallbackHotkeyRefreshTicks, now);
     }
 
     private void DispatchThreadMain()
@@ -1161,7 +1182,12 @@ internal sealed class KeyboardHook : IDisposable
 
             // Acknowledge only after a live dispatch worker has delivered the
             // request. Queue insertion alone is not proof that recovery can run.
-            if (delivered) _ = _rescueBroker.TryAcknowledgeFast();
+            if (delivered)
+            {
+                _ = slot.RescueSequence > 0
+                    ? _rescueBroker.TryAcknowledgeFast(slot.RescueSequence)
+                    : _rescueBroker.TryAcknowledgeFast();
+            }
         }
 
         ClearDispatchSlot(slot);
@@ -1173,6 +1199,7 @@ internal sealed class KeyboardHook : IDisposable
         {
             slot.Args = null;
             slot.LegacyCallback = null;
+            slot.RescueSequence = 0;
             Volatile.Write(ref _emergencyDispatchState, 0);
             return;
         }
@@ -1181,6 +1208,7 @@ internal sealed class KeyboardHook : IDisposable
         {
             slot.Args = null;
             slot.LegacyCallback = null;
+            slot.RescueSequence = 0;
             Volatile.Write(ref _fallbackDispatchState, 0);
             return;
         }
@@ -1189,6 +1217,7 @@ internal sealed class KeyboardHook : IDisposable
         {
             slot.Args = null;
             slot.LegacyCallback = null;
+            slot.RescueSequence = 0;
         }
     }
 
@@ -1201,18 +1230,21 @@ internal sealed class KeyboardHook : IDisposable
                 DispatchSlot slot = _dispatchQueue.Dequeue();
                 slot.Args = null;
                 slot.LegacyCallback = null;
+                slot.RescueSequence = 0;
             }
 
             if (Interlocked.CompareExchange(ref _emergencyDispatchState, 0, 1) == 1)
             {
                 _emergencyDispatchSlot.Args = null;
                 _emergencyDispatchSlot.LegacyCallback = null;
+                _emergencyDispatchSlot.RescueSequence = 0;
             }
 
             if (Interlocked.CompareExchange(ref _fallbackDispatchState, 0, 1) == 1)
             {
                 _fallbackDispatchSlot.Args = null;
                 _fallbackDispatchSlot.LegacyCallback = null;
+                _fallbackDispatchSlot.RescueSequence = 0;
             }
         }
     }
@@ -1271,8 +1303,8 @@ internal sealed class KeyboardHook : IDisposable
                                     ParseAltF4Mode(),
                                     nameof(Config.AltF4Mode),
                                     "Alt+F4");
-                                RecordCapture(args);
-                                QueueAction(args, _onAltF4Intercepted);
+                                long rescueSequence = RecordCapture(args);
+                                QueueAction(args, _onAltF4Intercepted, rescueSequence);
                             }
                             // Swallow held repeats too, otherwise Windows may close the
                             // focused window after the first accepted event.
@@ -1292,9 +1324,9 @@ internal sealed class KeyboardHook : IDisposable
                         if (accepted)
                         {
                             var args = new RecoveryHotkeyEventArgs(binding);
-                            RecordCapture(args);
+                            long rescueSequence = RecordCapture(args);
                             Action? legacy = binding.Action == RecoveryHotkeyAction.Panic ? _onPanic : _onAltF4Intercepted;
-                            QueueAction(args, legacy);
+                            QueueAction(args, legacy, rescueSequence);
                         }
                         return (IntPtr)1;
                     }
@@ -1423,7 +1455,10 @@ internal sealed class KeyboardHook : IDisposable
         return false;
     }
 
-    private bool QueueAction(RecoveryHotkeyEventArgs args, Action? legacyCallback)
+    private bool QueueAction(
+        RecoveryHotkeyEventArgs args,
+        Action? legacyCallback,
+        long rescueSequence)
     {
         if (Volatile.Read(ref _disposed) != 0) return false;
 
@@ -1440,6 +1475,7 @@ internal sealed class KeyboardHook : IDisposable
                     if (slot.Args is not null) continue;
                     slot.Args = args;
                     slot.LegacyCallback = legacyCallback;
+                    slot.RescueSequence = rescueSequence;
                     _dispatchQueue.Enqueue(slot);
                     _dispatchWake.Set();
                     return true;
@@ -1457,12 +1493,14 @@ internal sealed class KeyboardHook : IDisposable
         {
             _emergencyDispatchSlot.Args = args;
             _emergencyDispatchSlot.LegacyCallback = legacyCallback;
+            _emergencyDispatchSlot.RescueSequence = rescueSequence;
             Volatile.Write(ref _emergencyDispatchState, 1);
             try { _dispatchWake.Set(); }
             catch
             {
                 _emergencyDispatchSlot.Args = null;
                 _emergencyDispatchSlot.LegacyCallback = null;
+                _emergencyDispatchSlot.RescueSequence = 0;
                 Volatile.Write(ref _emergencyDispatchState, 0);
             }
             return true;
@@ -1475,6 +1513,7 @@ internal sealed class KeyboardHook : IDisposable
         {
             _fallbackDispatchSlot.Args = args;
             _fallbackDispatchSlot.LegacyCallback = legacyCallback;
+            _fallbackDispatchSlot.RescueSequence = rescueSequence;
             Volatile.Write(ref _fallbackDispatchState, 1);
             try
             {
@@ -1496,7 +1535,7 @@ internal sealed class KeyboardHook : IDisposable
         return false;
     }
 
-    private void RecordCapture(RecoveryHotkeyEventArgs args)
+    private long RecordCapture(RecoveryHotkeyEventArgs args)
     {
         long sequence = Interlocked.Increment(ref _captureCount);
         var receipt = new KeyboardCaptureReceipt(
@@ -1510,7 +1549,8 @@ internal sealed class KeyboardHook : IDisposable
         // Signal before queueing the typed event. A helper waiting on the named
         // event therefore receives a capture pulse even if the main dispatcher
         // is briefly starved or the UI thread is blocked.
-        _ = _rescueBroker.TrySignalFast(args.Hotkey);
+        _ = _rescueBroker.TrySignalFast(args.Hotkey, out long rescueSequence);
+        return rescueSequence;
     }
 
     private void TrackModifiers(in KBDLLHOOKSTRUCT kbd, bool keyUp)
@@ -1744,6 +1784,7 @@ internal sealed class KeyboardHook : IDisposable
     {
         public RecoveryHotkeyEventArgs? Args;
         public Action? LegacyCallback;
+        public long RescueSequence;
     }
 
     private sealed class DebounceSlot

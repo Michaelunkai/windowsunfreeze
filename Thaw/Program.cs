@@ -308,10 +308,21 @@ internal static class Program
                 using var channel = new RescueBroker(selfTestEvent);
                 if (!channel.IsAvailable || !channel.TrySignalFast("self-test") ||
                     !channel.Wait(0, out RescueSignal signal) || signal.Sequence == 0 ||
-                    !channel.TryAcknowledgeFast() || !channel.WaitForAcknowledgement(0))
+                    !channel.TryAcknowledgeFast(signal.Sequence) || !channel.WaitForAcknowledgement(0))
                     throw new InvalidOperationException("rescue signal/acknowledgement channel did not round-trip");
                 if (!channel.TryAcknowledgeFast() || channel.WaitForAcknowledgement(0))
                     throw new InvalidOperationException("duplicate rescue acknowledgement produced a stale pulse");
+                if (!channel.TrySignalFast("self-test-older", out long olderSequence) ||
+                    !channel.Wait(0, out RescueSignal olderSignal) ||
+                    olderSignal.Sequence != olderSequence ||
+                    !channel.TrySignalFast("self-test-newer", out long newerSequence) ||
+                    !channel.Wait(0, out RescueSignal newerSignal) ||
+                    newerSignal.Sequence != newerSequence || newerSequence <= olderSequence ||
+                    !channel.TryAcknowledgeFast(newerSequence) ||
+                    !channel.WaitForAcknowledgement(0) ||
+                    !channel.TryAcknowledgeFast(olderSequence) ||
+                    channel.WaitForAcknowledgement(0))
+                    throw new InvalidOperationException("out-of-order rescue acknowledgement was not sequence-gated");
                 Console.WriteLine("Self-test: PASS — per-user rescue event and acknowledgement channel round-trip");
             }
             catch (Exception ex)
@@ -617,11 +628,12 @@ internal static class Program
         broker.DrainAcknowledgements();
         var state = new RescueFallbackState();
         RescueHotkeyMonitor? hotkeys = null;
+        Action<RecoveryHotkeyBinding> rescueHotkeyHandler = binding =>
+            HandleRescueRequest(parent, broker, state, "registered:" + binding.Chord.Text);
+        long lastHotkeyMonitorRestartTick = Environment.TickCount64;
         try
         {
-            hotkeys = new RescueHotkeyMonitor(
-                config,
-                binding => HandleRescueRequest(parent, broker, state, "registered:" + binding.Chord.Text));
+            hotkeys = new RescueHotkeyMonitor(config, rescueHotkeyHandler);
         }
         catch (Exception ex)
         {
@@ -641,6 +653,25 @@ internal static class Program
                 try { exited = parent.WaitForExit(100); }
                 catch { exited = true; }
                 if (exited) break;
+
+                long now = Environment.TickCount64;
+                if ((hotkeys is null || !hotkeys.IsAlive) &&
+                    now - lastHotkeyMonitorRestartTick >= 2_000)
+                {
+                    lastHotkeyMonitorRestartTick = now;
+                    try { hotkeys?.Dispose(); } catch { }
+                    try
+                    {
+                        hotkeys = new RescueHotkeyMonitor(
+                            Config.Load(ConfigPathWithoutCreating()), rescueHotkeyHandler);
+                        Console.WriteLine("Rescue hotkey monitor restarted after thread exit.");
+                    }
+                    catch (Exception ex)
+                    {
+                        hotkeys = null;
+                        Console.Error.WriteLine("Rescue hotkey monitor restart failed: " + ex.Message);
+                    }
+                }
 
                 try { hotkeys?.RefreshConfigurationIfChanged(); } catch { }
 

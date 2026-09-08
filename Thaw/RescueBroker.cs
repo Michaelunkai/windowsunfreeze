@@ -196,10 +196,21 @@ public sealed class RescueBroker : IDisposable
     /// </summary>
     public bool TrySignalFast(string reason = "Alt+F4")
     {
+        return TrySignalFast(reason, out _);
+    }
+
+    /// <summary>
+    /// Fast signal overload that returns the exact broker sequence assigned to
+    /// this capture. The sequence is carried through the dispatch slot so an
+    /// older queued request cannot acknowledge a newer request by accident.
+    /// </summary>
+    public bool TrySignalFast(string reason, out long sequence)
+    {
+        sequence = 0;
         if (Volatile.Read(ref _disposed) != 0 || _signalEvent is null)
             return false;
 
-        long sequence = Interlocked.Increment(ref _sequence);
+        sequence = Interlocked.Increment(ref _sequence);
         var signal = new RescueSignal(
             sequence,
             Stopwatch.GetTimestamp(),
@@ -254,12 +265,18 @@ public sealed class RescueBroker : IDisposable
     /// </summary>
     public bool TryAcknowledgeFast()
     {
+        long sequence = Interlocked.Read(ref _sequence);
+        return TryAcknowledgeFast(sequence);
+    }
+
+    /// <summary>Acknowledges the exact capture sequence delivered by a dispatch slot.</summary>
+    public bool TryAcknowledgeFast(long sequence)
+    {
         if (Volatile.Read(ref _disposed) != 0 || _acknowledgementEvent is null)
             return false;
 
         try
         {
-            long sequence = Interlocked.Read(ref _sequence);
             if (sequence <= 0) return false;
             return TryPublishAcknowledgement(sequence);
         }

@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.1**
+Version **1.4.2**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -99,7 +99,9 @@ application memory or process dumps.
   acknowledge a capture, the helper starts one headless bounded force-all recovery. This
   is an emergency fallback, not a second normal recovery loop, and it never runs arbitrary
   commands. Its registered-hotkey message loop re-registers after a recoverable
-  message/queue failure and refreshes its registrations after a live config change.
+  message/queue failure, retries rejected registrations, renews them periodically, and
+  refreshes its registrations after a live config change; the parent helper recreates the
+  monitor thread if it exits.
 - **Watchdog** (`Watchdog.cs`) — samples scheduling delay, CPU, and RAM each second.
   It drives the alert icon and can request automatic recovery after a hard stall when
   `AutoUnfreezeOnStall` is enabled. Automatic recovery is deliberately diagnostics-only;
@@ -110,8 +112,8 @@ application memory or process dumps.
   commit, disk, DPC/ISR, network, GPU-engine, QoS, foreground-process, and real DWM
   composition/frame evidence. Alt+F4 also starts bounded DWM-frame, foreground WM_NULL and
   wait-chain, desktop-refresh, resource-cause, recent-event, and all-device diagnostics
-  alongside recovery and records rollback receipts. The expanded graph is sized so these
-  actions are queued rather than silently dropped.
+  alongside recovery and records rollback receipts, including native restore failures.
+  The expanded graph is sized so these actions are queued rather than silently dropped.
 - **Tray guard** (`AppContext.cs`) — shows health, privilege level, cooldown, and
   in-progress state. It prevents duplicate normal requests while allowing the emergency
   request to bypass the short cooldown. It cannot cancel an engine pass already running.

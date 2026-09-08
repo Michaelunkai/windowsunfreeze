@@ -11,10 +11,14 @@ namespace Thaw;
 internal sealed class RescueHotkeyMonitor : IDisposable
 {
     private const uint WM_QUIT = 0x0012;
+    private const uint WM_TIMER = 0x0113;
     private const uint WM_APP_STOP = 0x8000 + 0x71;
     private const uint WM_APP_REFRESH = 0x8000 + 0x72;
     private const uint WM_HOTKEY = (uint)Native.WM_HOTKEY;
     private const int FirstHotkeyId = 0x5B00;
+    private const uint HealthTimerId = 0x5BFF;
+    private const int HealthTimerIntervalMs = 5_000;
+    private const int ForcedRenewalIntervalMs = 30_000;
 
     private readonly string _configPath;
     private readonly Action<RecoveryHotkeyBinding> _onHotkey;
@@ -28,6 +32,7 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private long _lastConfigProbeTick;
     private long _lastConfigWriteTicks;
     private long _lastConfigLength = -1;
+    private long _lastRegistrationTick;
     private int _disposed;
     private int _threadId;
 
@@ -49,6 +54,7 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     }
 
     internal bool IsReady => _ready.IsSet;
+    internal bool IsAlive => _thread.IsAlive && Volatile.Read(ref _threadId) != 0;
     internal int RegisteredCount
     {
         get { lock (_gate) return _registered.Count; }
@@ -57,6 +63,7 @@ internal sealed class RescueHotkeyMonitor : IDisposable
     private void ThreadMain()
     {
         Volatile.Write(ref _threadId, unchecked((int)GetCurrentThreadId()));
+        uint timerId = 0;
         try
         {
             // RegisterHotKey posts to this thread's queue, so create it before
@@ -64,6 +71,9 @@ internal sealed class RescueHotkeyMonitor : IDisposable
             PeekMessage(out Message initial, IntPtr.Zero, 0, 0, 0);
             try { RegisterAlwaysHotkeys(); }
             catch (Exception ex) { Log.Error("Rescue hotkey registration failed; retrying loop", ex); }
+            timerId = SetTimer(IntPtr.Zero, HealthTimerId, HealthTimerIntervalMs, IntPtr.Zero);
+            if (timerId == 0)
+                Log.Debug("Rescue hotkey health timer unavailable");
             _ready.Set();
 
             while (Volatile.Read(ref _disposed) == 0)
@@ -91,6 +101,12 @@ internal sealed class RescueHotkeyMonitor : IDisposable
                         ApplyPendingConfiguration();
                         continue;
                     }
+                    if (timerId != 0 && message.message == WM_TIMER &&
+                        message.wParam == new IntPtr(unchecked((long)timerId)))
+                    {
+                        MaintainRegistrations();
+                        continue;
+                    }
                     if (message.message != WM_HOTKEY)
                         continue;
 
@@ -116,6 +132,10 @@ internal sealed class RescueHotkeyMonitor : IDisposable
         }
         finally
         {
+            if (timerId != 0)
+            {
+                try { KillTimer(IntPtr.Zero, timerId); } catch { }
+            }
             UnregisterAll();
             _ready.Set();
             _stopped.Set();
@@ -171,8 +191,17 @@ internal sealed class RescueHotkeyMonitor : IDisposable
             Interlocked.Exchange(ref _lastConfigWriteTicks, writeTicks);
             Interlocked.Exchange(ref _lastConfigLength, length);
             int threadId = Volatile.Read(ref _threadId);
-            if (threadId != 0 && !PostThreadMessage((uint)threadId, WM_APP_REFRESH, IntPtr.Zero, IntPtr.Zero))
+            bool posted = threadId != 0 &&
+                          PostThreadMessage((uint)threadId, WM_APP_REFRESH, IntPtr.Zero, IntPtr.Zero);
+            if (!posted)
+            {
+                // Keep the metadata dirty so a live monitor restart can retry
+                // the configuration hand-off instead of losing the pending
+                // registration update forever.
+                Interlocked.Exchange(ref _lastConfigWriteTicks, long.MinValue);
+                Interlocked.Exchange(ref _lastConfigLength, long.MinValue);
                 Log.Debug("Rescue hotkey configuration refresh post failed");
+            }
         }
         catch (Exception ex)
         {
@@ -234,6 +263,31 @@ internal sealed class RescueHotkeyMonitor : IDisposable
                 Log.Warn("Rescue hotkey could not be registered: " + binding.Chord.Text);
             }
             id++;
+        }
+        Volatile.Write(ref _lastRegistrationTick, Environment.TickCount64);
+    }
+
+    private void MaintainRegistrations()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        Config config = Volatile.Read(ref _config);
+        int expected = config.GetAlwaysFallbackHotkeys().Count;
+        int actual = RegisteredCount;
+        long now = Environment.TickCount64;
+        long previous = Volatile.Read(ref _lastRegistrationTick);
+        bool missing = actual < expected;
+        bool renewalDue = previous == 0 || now - previous >= ForcedRenewalIntervalMs;
+        if (!missing && !renewalDue) return;
+
+        try { UnregisterAll(); } catch { }
+        try
+        {
+            RegisterAlwaysHotkeys();
+            Log.Info("Rescue hotkeys renewed (registered=" + RegisteredCount + ", expected=" + expected + ")");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Rescue hotkey renewal failed", ex);
         }
     }
 
@@ -309,6 +363,17 @@ internal sealed class RescueHotkeyMonitor : IDisposable
         uint message,
         IntPtr wParam,
         IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SetTimer(
+        IntPtr hWnd,
+        uint nIDEvent,
+        uint uElapse,
+        IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool KillTimer(IntPtr hWnd, uint uIDEvent);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Message
