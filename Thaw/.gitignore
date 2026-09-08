@@ -3,4 +3,8 @@ obj/
 publish/
 publish-standalone/
 .dotnet/
+.dotnet-build/
+.stage/
+.agents/
+artifacts/
 *.user

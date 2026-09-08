@@ -5,74 +5,83 @@ sessions.** Each entry explains *what* it does, *why* it helps, the *exact API +
 *where it lives in the code*, *admin requirements*, and *caveats*.
 
 Project layout: `Thaw/` — `Unfreezer.cs` (engine), `Watchdog.cs` (detection),
-`KeyboardHook.cs` (Alt+F4), `Native.cs` (all P/Invoke), `AppContext.cs` (tray + wiring),
+`KeyboardHook.cs` (Alt+F4 plus panic/slowdown/frame-drop chords), `RescueHotkeyMonitor.cs` (helper fallback), `Native.cs` (all P/Invoke), `AppContext.cs` (tray + wiring),
 `Config.cs` (settings), `Icons.cs` (artwork).
 
 ---
 
-## 0. The full unfreeze sequence (order matters)
+## 0. Recovery surfaces and sequence
 
-Every Alt+F4 (or panic hotkey / tray double-click / auto-stall) runs `Unfreezer.Run()` in
-this exact order:
+Normal tray recovery uses the slowdown/system profile. Alt+F4 force-runs every configured
+display, DWM, system, memory/cache, Explorer, optional temporary power, desktop-refresh,
+foreground-probe, and resource-diagnostic tier concurrently. The complete graph is queued
+into a 24-worker pre-warmed pool, so the diagnostic tail is not silently dropped.
+Ctrl+Alt+S selects system recovery directly;
+Ctrl+Alt+G selects display recovery; the panic chord also combines both profiles.
+An enabled automatic trigger uses a diagnostics-only safe profile.
+Strong shell recovery is a separate, confirmation-gated call to `RestartExplorerNow()`.
+
+When enabled, the normal/emergency sequence is:
 
 | # | Method | File / function | Admin? |
 |---|---|---|---|
-| 1 | Own process → High priority + thread → Time-Critical | `Unfreezer.Run` | no |
-| 2 | Timer resolution → 1 ms (`timeBeginPeriod`) | `Unfreezer.Run` | no |
-| 3 | GPU driver reset (Ctrl+Shift+Win+B) | `Unfreezer.ResetGpuDriver` | no |
-| 4 | DWM soft-freeze rescue (screen still frozen after 1.2 s) | `Unfreezer.IsScreenStillFrozen` / `RestartDwm` | yes |
-| 5 | `EmptyWorkingSet` on every process | `Unfreezer.TrimWorkingSet` | partial (per-process ACL) |
-| 6 | Standby + modified page list purge | `Unfreezer.PurgeStandbyList` / `PurgeModifiedPageList` | yes |
-| 7 | System file cache flush | `Unfreezer.FlushFileCache` | yes |
-| 8 | Foreground app + shell → High priority | `Unfreezer.BoostToHigh` | partial |
-| 9 | High Performance power plan (restored after N s) | `Unfreezer.BoostPowerPlan` | yes |
-| 10 | Force-restart explorer.exe (shell/taskbar) | `Unfreezer.RestartExplorer` | no (elevated = elevated shell) |
-| 11 | Tray icon re-registration (after explorer restart) | `AppContext.ReAddTrayIcon` | — |
+| 1 | Own process/thread → bounded Above Normal/Highest recovery priority | `Unfreezer.Run` | no |
+| 2 | Profile selection + watchdog diagnostics | `AppContext` / `Unfreezer.Run` | no |
+| 3 | GPU driver reset for frame-drop or panic profile (Ctrl+Shift+Win+B) | `Unfreezer.ResetGpuDriver` | SendInput may fail |
+| 4 | Panic-only optional DWM rescue after independent hung + stall evidence | `Unfreezer.IsScreenStillFrozen` / `RestartDwm` | opt-in; disruptive |
+| 5 | Best-effort working-set tuning for eligible processes | `Unfreezer.TrimWorkingSet` | partial (per-process ACL) |
+| 6 | Optional standby + modified page list purge | `Unfreezer.PurgeStandbyList` / `PurgeModifiedPageList` | admin; system-wide |
+| 7 | Optional system file cache flush | `Unfreezer.FlushFileCache` | admin; system-wide |
+| 8 | Normal-priority foreground/shell → Above Normal temporarily | `Unfreezer.BoostTemporarily` | partial; restored in `finally` |
+| 9 | Optional temporary High Performance plan with exact end-of-run restore | `Unfreezer.TryBoostPowerPlanWithJournal` (Alt+F4 only) | admin; machine-wide; restore can be lost on crash |
+| 10 | Optional Explorer restart (shell/taskbar) | `Unfreezer.RestartExplorer` | intentional process termination |
+| 11 | Tray icon re-registration (after Explorer restart) | `AppContext.ReAddTrayIcon` | — |
+| 12 | Bounded desktop/theme refresh broadcast | `Native.TryBroadcastDesktopRefresh` | no; hung recipients are timed out |
+| 13 | Foreground `WM_NULL` responsiveness probe | `NativeDiagnostics.TryProbeWindow` | read-only |
+| 14 | Resource-cause receipt (commit, pagefile, disk, queue, DPC/ISR, network, GPU, thermal, frames, I/O) | `Unfreezer.BuildResourceDiagnostic` | read-only |
+| 15 | Recent event correlation and all present-device problem enumeration | `NativeDiagnostics.CorrelateRecentEvents` / `EnumerateDeviceProblems` | read-only; bounded |
 
-Methods 3–4 happen **before** memory work (display recovery first); explorer restart happens
-**last** (shell comes back with a clean, RAM-rich system).
+The force profile dispatches independent actions concurrently; Explorer restart, when
+enabled, is still restricted to the exact interactive shell process. A completion event and
+the log are the evidence of an attempted sequence; a trigger line alone does not prove that
+Windows accepted every operation. AppContext
+also records a bounded aggregate incident receipt plus the engine's per-action phase/outcome/
+elapsed/detail and rollback receipts, and shows immediate capture feedback before the worker
+starts.
 
 ---
 
-## 1. Own-process priority + Time-Critical thread
+## 1. Bounded recovery priority
 
-**Why:** when the PC is slammed, the unfreezer itself must be scheduled before it can help
-anything else. High class for the process, Time-Critical for the worker thread.
+**Why:** when the PC is slammed, the recovery worker still needs CPU time. Thaw uses
+Above Normal for its process only when it began at Normal and `ThreadPriority.Highest`
+for the bounded worker; it never uses Real-Time or Time-Critical scheduling.
 
 ```csharp
-Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;   // 0x80 HIGH_PRIORITY_CLASS
-SetThreadPriority(GetCurrentThread(), 15);                               // THREAD_PRIORITY_TIME_CRITICAL
+Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
+Thread.CurrentThread.Priority = ThreadPriority.Highest;
 ```
 
 Restored to Normal afterwards in the `finally` block.
 
 - File: `Unfreezer.cs` → `Run()` start / `finally`.
-- P/Invoke: `kernel32.dll SetThreadPriority(HANDLE, int)` (local), managed `Process.PriorityClass`.
+- Implementation uses managed `Process.PriorityClass` / `Thread.Priority` and restores both.
 
 ---
 
-## 2. High-resolution timer (`timeBeginPeriod`)
+## 2. Timer resolution deliberately unchanged
 
-**Why:** Windows normally runs at 15.6 ms timer granularity. Under 1 ms the OS wakes more
-often, which makes the UI feel dramatically smoother and lets a stuck foreground app recover
-faster. The system-wide timer resolution is changed by whoever requests the finest period.
-
-```c
-timeBeginPeriod(1);   // winmm.dll
-timeEndPeriod(1);     // always in finally
-```
-
-- File: `Unfreezer.cs` → `Run()`.
-- P/Invoke: `winmm.dll timeBeginPeriod/timeEndPeriod(uint)`.
-- Note: period is system-global while held; we hold it only for the duration of the unfreeze.
+Thaw does not call `timeBeginPeriod` during recovery. A finer periodic timer can increase
+scheduler wakeups and power use and does not repair a frame-rate or capacity bottleneck.
 
 ---
 
 ## 3. GPU driver reset (Ctrl+Shift+Win+B)
 
-**Why:** the single most common cause of "screen stuck / stutter but PC responsive" is a hung
-or wedged graphics driver (TDR). Windows' own hidden hotkey **Ctrl+Shift+Win+B** tells the
-kernel to reload the display driver. Thaw injects it with `SendInput`.
+**Why:** Windows exposes **Ctrl+Shift+Win+B** as a graphics-driver reset shortcut that may
+help when the display is stuck while the rest of the session is alive. Thaw attempts the
+shortcut with `SendInput`; this is an input request, not proof that the driver accepted it.
+Windows, desktop integrity, focus, or another hook can reject or alter the attempt.
 
 ```csharp
 // order: Ctrl down, Shift down, Win down, B down, then all up
@@ -85,15 +94,17 @@ Key(0x42, true);  Key(0x5B, true);  Key(0x10, true);  Key(0x11, true);
 
 - File: `Unfreezer.cs` → `ResetGpuDriver()` / `Key()`.
 - P/Invoke: `user32.dll SendInput(uint, INPUT[], int)` (see `Native.INPUT/INPUTUNION/KEYBDINPUT`).
-- Caveat: screen blanks ~1 s. Config: `ResetGpuDriver`.
+- Caveat: screen may blank ~1 s, the request may do nothing, and the result is not directly
+  observable from user mode. Config: `ResetGpuDriver` (keep opt-in while diagnosing).
 
 ---
 
 ## 4. DWM soft-freeze rescue (restart the compositor)
 
-**Why:** if the desktop compositor (dwm.exe) hangs, the screen stays frozen even after the
-GPU reset. Thaw waits 1.2 s after the reset, checks whether the compositor is unresponsive,
-and if so terminates dwm.exe — Windows respawns a fresh compositor automatically.
+**Why:** if the desktop compositor (dwm.exe) appears hung, the screen can stay frozen after
+a display reset. When explicitly configured, Thaw waits 1.2 s, checks the compositor, and
+may terminate dwm.exe so Windows can respawn it. This is a disruptive, heuristic-gated
+operation, not a guaranteed diagnosis or repair.
 
 **Detection — two signals:**
 1. `IsHungAppWindow(dwmWindow)` — the OS's own hung check. The window is found by
@@ -111,18 +122,18 @@ foreach (var p in Process.GetProcessesByName("dwm")) { p.Kill(); p.WaitForExit(3
 
 - File: `Unfreezer.cs` → `IsScreenStillFrozen()` / `IsDwmHung()` / `RestartDwm()`.
 - P/Invoke: `user32.dll FindWindow, EnumWindows, GetWindowThreadProcessId, IsHungAppWindow`.
-- Caveat: display goes black ~1–2 s. Only fires when the screen is genuinely still frozen
-  (healthy screens produce no false positives — verified: `hung=False`).
-- Config: `RestartDwmOnFrozenScreen`.
+- Caveat: display can go black ~1–2 s, and a heuristic can be wrong. Only fires when enabled
+  by `RestartDwmOnFrozenScreen` and the configured check reports a possible freeze.
 
 ---
 
-## 5. `EmptyWorkingSet` on every process (instant RAM)
+## 5. Working-set tuning for eligible processes
 
-**Why:** during memory-pressure freezes, physical RAM is exhausted and the system thrashes the
-pagefile. Trimming every process's working set (the classic RAMMap/CleanMem/EmptyStandbyList
-technique) forces pages out of physical RAM instantly, giving the system breathing room.
-Nothing is closed; apps page their data back on demand.
+**Why:** during memory-pressure freezes, physical RAM can be under pressure and the system
+may thrash the pagefile. Where the engine has permission, working-set tuning can give the
+system temporary breathing room. It is not a guarantee of freed memory or a substitute for
+finding the process or workload causing pressure. Nothing is closed by this step; pages can
+fault back in on demand.
 
 ```csharp
 IntPtr h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, false, pid);
@@ -130,7 +141,7 @@ EmptyWorkingSet(h);
 CloseHandle(h);
 ```
 
-- File: `Unfreezer.cs` → `TrimWorkingSet()` (called for every process).
+- File: `Unfreezer.cs` → `TrimWorkingSet()` (called for eligible process candidates).
 - P/Invoke: `kernel32.dll OpenProcess`, `psapi.dll EmptyWorkingSet`, `kernel32.dll CloseHandle`.
 - Skipped: own process, PID 0/4, and `DoNotTrim` set = {System, Idle, Registry,
   Secure System, Memory Compression}. Access-denied processes are silently skipped.
@@ -141,8 +152,8 @@ CloseHandle(h);
 ## 6. Standby list purge
 
 **Why:** Windows caches files/executables in the "standby" memory list. Under RAM pressure
-this cache can starve running apps. Purging the standby list returns that memory to
-applications instantly.
+this cache can compete with active work. An explicitly enabled purge requests that Windows
+reclaim the list; it is system-wide and may not be available or beneficial.
 
 ```csharp
 NtSetSystemInformation(SystemMemoryListInformation /*0x50*/, &MemoryPurgeStandbyList /*1*/, 4);
@@ -153,28 +164,33 @@ NtSetSystemInformation(SystemMemoryListInformation /*0x50*/, &MemoryPurgeStandby
 - Requires: **admin** + enabling `SeProfileSingleProcessPrivilege`
   (`Native.EnablePrivilege` → `OpenProcessToken` + `LookupPrivilegeValue` +
   `AdjustTokenPrivileges`).
+- Safety: keep disabled while diagnosing unless the user has explicitly opted into a
+  machine-wide memory operation.
 - Status: logged as `Standby list purge: NTSTATUS 0x00000000` on success.
 
 ---
 
 ## 7. Modified page list purge
 
-**Why:** dirty pages waiting to be written to disk. Purging forces those writes out now,
-freeing more RAM and reducing later disk stalls. Slightly disk-heavy for a moment.
+**Why:** dirty pages waiting to be written to disk can contribute to memory pressure. An
+explicitly enabled purge asks Windows to process that list; it can be disk-heavy and is not
+guaranteed to reduce stalls.
 
 ```csharp
 NtSetSystemInformation(SystemMemoryListInformation /*0x50*/, &MemoryPurgeModifiedPageList /*2*/, 4);
 ```
 
 - File: `Unfreezer.cs` → `PurgeModifiedPageList()`.
-- Same requirements as standby purge (admin + `SeProfileSingleProcessPrivilege`).
+- Same requirements as standby purge (admin + `SeProfileSingleProcessPrivilege`); keep it
+  opt-in because it is system-wide.
 
 ---
 
 ## 8. System file cache flush
 
-**Why:** the system file cache working set can hold gigabytes. Flushing it to its minimum
-releases that RAM for running apps.
+**Why:** the system file cache can hold substantial memory. An explicitly enabled flush asks
+Windows to reduce it; applications may need to reload data and the result is workload-
+dependent.
 
 ```c
 SetSystemFileCacheSize((SIZE_T)-1, (SIZE_T)-1, 0);   // -1,-1,0 = flush to minimum
@@ -183,50 +199,51 @@ SetSystemFileCacheSize((SIZE_T)-1, (SIZE_T)-1, 0);   // -1,-1,0 = flush to minim
 - File: `Unfreezer.cs` → `FlushFileCache()`.
 - P/Invoke: `kernel32.dll SetSystemFileCacheSize(IntPtr, IntPtr, uint)`.
 - Requires: **admin** + enabling `SeIncreaseQuotaPrivilege`.
+- Safety: this is a machine-wide cache operation; keep it disabled unless explicitly
+  authorized and verify the return value in the log.
 
 ---
 
 ## 9. Foreground app + shell priority boost
 
-**Why:** priority is relative — boosting everything is a no-op. Boosting the app you're
-actually using plus the shell (explorer/dwm/Start menu/Search) makes the visible system
-responsive while background processes keep their share.
+**Why:** priority is relative. A temporary boost to the foreground app plus selected shell
+components may improve visible responsiveness, but it can also add scheduler pressure and
+does not fix the underlying workload.
 
 ```csharp
-SetPriorityClass(hProcess, 0x00000080);   // HIGH_PRIORITY_CLASS
+SetPriorityClass(hProcess, 0x00008000);   // ABOVE_NORMAL_PRIORITY_CLASS
 ```
 
 Boosted: `GetForegroundWindow()` → `GetWindowThreadProcessId` → that PID; plus `ShellApps` =
 {explorer, dwm, ShellExperienceHost, StartMenuExperienceHost, SearchHost}.
 
-- File: `Unfreezer.cs` → `BoostToHigh()`.
+- File: `Unfreezer.cs` → `BoostTemporarily()`; only Normal-priority targets are changed and every handle/class is restored.
 - P/Invoke: `kernel32.dll OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION)`,
   `kernel32.dll SetPriorityClass`.
+- Safety: this is best-effort and should be evaluated with the current workload; a priority
+  boost is not evidence that the machine has more capacity.
 
 ---
 
-## 10. High Performance power plan
+## 10. Power plan safety boundary
 
-**Why:** balanced/eco power plans throttle CPU frequency and C-states. Forcing High
-Performance removes throttling so everything runs at full speed (especially under short
-bursts where the governor lags).
-
-```csharp
-PowerGetActiveScheme(IntPtr.Zero, out guidPtr);            // save current plan
-PowerSetActiveScheme(IntPtr.Zero, ref HighPerformanceGuid);// 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-// after PowerPlanRestoreAfterSeconds (default 120 s, 0 = keep): restore saved plan
-```
-
-- File: `Unfreezer.cs` → `BoostPowerPlan()` (restore on a background thread).
-- P/Invoke: `powrprof.dll PowerGetActiveScheme / PowerSetActiveScheme`, `LocalFree` the GUID.
-- Requires: **admin**. Config: `PowerPlanBoost` (default on), `PowerPlanRestoreAfterSeconds`.
+The default profile leaves the active power plan untouched. When `PowerPlanBoost` is enabled,
+the **Alt+F4 force profile only** may temporarily select Windows' High Performance scheme
+(`SCHEME_MIN`) before the force-run. The previously active scheme is captured in the rollback
+journal and restored at the end of the bounded pass. The operation is machine-wide, requires
+the relevant Windows permission, and is not proof that a recovery action succeeded. A process
+crash, power loss, killed helper, or `powercfg` failure can still prevent the restore; inspect
+the log and current Windows power-plan state when this matters.
+Other triggers record `safety-policy-no-persistent-changes` and do not change the plan.
 
 ---
 
 ## 11. Explorer restart (shell/taskbar)
 
-**Why:** a hung shell is one of the most common "whole desktop frozen" states. Force-restarting
-explorer re-creates the taskbar, start menu, desktop icons and File Explorer windows.
+**Why:** a hung shell can make the desktop, taskbar, and File Explorer appear frozen.
+When explicitly enabled or selected through the confirmed strong action, restarting
+Explorer asks Windows to recreate that shell surface. It is not a general process or
+hardware recovery.
 
 Equivalent to the reference command:
 ```powershell
@@ -246,10 +263,11 @@ WTSGetActiveConsoleSessionId() → WTSQueryUserToken(session, out token)
 - P/Invoke: `kernel32.dll WTSGetActiveConsoleSessionId`, `wtsapi32.dll WTSQueryUserToken`,
   `advapi32.dll CreateProcessAsUser` (see `Native.STARTUPINFO/PROCESS_INFORMATION`).
 - Note: `WTSQueryUserToken` needs SYSTEM (`SeTcbPrivilege`), so from a plain elevated Thaw it
-  usually falls back to `Process.Start` — explorer then runs elevated, exactly like running
-  the user's PowerShell from an admin prompt.
-- Config: `RestartExplorerOnUnfreeze` (default on). Manual menu item: "Restart Explorer Now".
-- explorer is the **only** process ever terminated by Thaw.
+  may fall back to `Process.Start`; verify the resulting Explorer integrity level if it
+  matters.
+- Config: `RestartExplorerOnUnfreeze` (recommended default off). Tray action: confirmed
+  "Strong recovery — restart Explorer shell".
+- Explorer is the **only** process intentionally terminated by this operation.
 
 ---
 
@@ -279,8 +297,10 @@ clamp((mem−70)/(MemStressPercent−70)).
 
 **Stressed** when score > 0.40 **or** delay ≥ `StallThresholdMs` (2500). Hysteresis: stays
 stressed until 5 consecutive healthy samples with score < 0.25 and delay < 1200 ms.
-**Hard stall** (delay ≥ `HardStallMs`, 6000) fires `HardStallDetected` → automatic unfreeze
-(if `AutoUnfreezeOnStall`), then a 2 s breather. `RecentStall` = stall within the last 30 s.
+**Hard stall** (delay ≥ `HardStallMs`, 6000) fires `HardStallDetected`; the tray requests
+automatic recovery only when `AutoUnfreezeOnStall` is explicitly enabled (recommended
+default off), then the watchdog takes a 2 s breather. `RecentStall` = stall within the last
+30 s. A hard-stall signal is not a root-cause diagnosis.
 
 - P/Invoke: `kernel32.dll GetSystemTimes`, `kernel32.dll GlobalMemoryStatusEx`
   (`Native.MEMORYSTATUSEX`).
@@ -290,26 +310,63 @@ stressed until 5 consecutive healthy samples with score < 0.25 and delay < 1200 
 ## Keyboard hook — how Alt+F4 is captured
 
 `KeyboardHook.cs` — a global `WH_KEYBOARD_LL` low-level hook installed with
-`SetWindowsHookEx(13, proc, GetModuleHandle(null), 0)`; callbacks arrive on the app's own
-message loop thread (`Application.Run`). Every key event updates a modifier-state tracker
+`SetWindowsHookEx(13, proc, GetModuleHandle(null), 0)` on a dedicated highest-priority
+native message-loop thread independent of `Application.Run`. A 250 ms heartbeat renews the
+hook when needed, while a preallocated dispatch ring and per-user rescue event preserve the
+sub-second activation path. Every key event updates a modifier-state tracker
 (handles **both** generic and left/right VKs: VK_MENU 0x12 / VK_LMENU 0xA4 / VK_RMENU 0xA5,
 VK_CONTROL 0x11 / VK_LCONTROL 0xA2 / VK_RCONTROL 0xA3, VK_SHIFT 0x10 / 0xA0 / 0xA1 — real
 keyboards send the left/right codes; the generic-only bug was caught and fixed).
 
 **Alt+F4:** on F4 (0x73) keydown with Alt (`LLKHF_ALTDOWN` = flags bit 0x20, or tracked
 state), `_shouldInterceptAltF4()` decides by `AltF4Mode`:
-- `always` → always swallow (default; window closing via Alt+F4 disabled),
+- `always` → always swallow (explicit compatibility mode; window closing via Alt+F4 disabled),
 - `stressed` → swallow only while `Watchdog.Stressed || Watchdog.RecentStall`,
 - `off` → never swallow.
 
 Swallowing = return `(IntPtr)1` from the hook proc (the keystroke never reaches any window),
-then trigger the unfreeze. **Panic hotkey** (default Ctrl+Alt+U) is always swallowed and
-always unfreezes. Config: `AltF4Mode`, `PanicHotkey`.
+then request recovery. **Alt+F4** and **panic** (default Ctrl+Alt+U) request the combined profile;
+**slowdown** (Ctrl+Alt+S) selects system recovery and **frame drop** (Ctrl+Alt+G) selects
+display-only recovery. Held repeats, injected input, duplicate chords, and presses inside
+the configurable debounce window are rejected. Config reload rebuilds the live binding table.
 
 - P/Invoke: `user32.dll SetWindowsHookEx/UnhookWindowsHookEx/CallNextHookEx/GetAsyncKeyState`,
   `KBDLLHOOKSTRUCT` (vkCode, scanCode, flags, time, dwExtraInfo).
 - Note: LL hooks receive input across integrity levels, so Alt+F4 is caught even when an
   elevated window is focused.
+
+---
+
+## Capture-path hardening (1.4.0)
+
+The keybind path now has several independent boundaries so a busy UI thread or a damaged
+single hook does not erase the user's emergency request:
+
+1. **Two independent low-level hooks** — the primary and emergency `WH_KEYBOARD_LL` hooks
+   use separate native message-loop threads. Each has its own handle, heartbeat, and bounded
+   reinstall path; the newer hook gets the first opportunity while the primary remains a
+   fallback.
+2. **Lock-free callback edge** — callbacks use per-hook key state, atomic configuration
+   references, a concurrent debounce table, and no synchronous file logging or recovery work.
+   Callback faults are counted and passed through to Windows.
+3. **Reserved emergency dispatch slot** — a 32-slot pre-warmed dispatch ring is backed by
+   one reserved slot for the case where cleanup briefly owns the normal queue. A capture is
+   never allowed to run the recovery engine synchronously; if an extreme burst fills both
+   paths, the dropped count is surfaced instead of hiding the loss.
+4. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
+   event and the dispatch path immediately pulses a paired acknowledgement event. The
+   optional helper can distinguish an accepted in-process request from a missing one.
+5. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
+   `RegisterHotKey` registrations for always-on panic/frame-drop chords. If the main process
+   does not acknowledge a request within the bounded window, it starts one headless,
+   force-all recovery. `Alt+F4` remains low-level-hook-only because `RegisterHotKey` cannot
+   guarantee close suppression.
+6. **Capture telemetry** — support diagnostics expose primary/emergency installation,
+   registered fallback count, available capture path, capture count, dispatch drops, callback
+   faults, and the most recent captured chord.
+
+These are still user-mode recovery paths. If Windows cannot schedule either process, the
+input stack, kernel, power source, or hardware has failed, no executable can react.
 
 ---
 
@@ -332,29 +389,54 @@ re-launches with `--elevated` (skips the single-instance mutex).
 {
   "AltF4Mode": "always",                 // "always" | "stressed" | "off"
   "PanicHotkey": "Ctrl+Alt+U",           // e.g. "Alt+F4", "Ctrl+Shift+U", "F12"
-  "AutoUnfreezeOnStall": true,           // auto-unfreeze on hard stall (> HardStallMs)
+  "SlownessHotkey": "Ctrl+Alt+S",
+  "SlownessHotkeyMode": "stressed",
+  "FrameDropHotkey": "Ctrl+Alt+G",
+  "FrameDropHotkeyMode": "always",
+  "HotkeyDebounceMs": 750,
+  "AutoUnfreezeOnStall": false,          // opt in: auto recovery on hard stall
   "ShowBalloons": true,                  // unfreeze result balloons
   "DebugLog": false,                     // verbose key/hook/DWM logging
   "StallThresholdMs": 2500,              // delay that flags the system as stressed
   "HardStallMs": 6000,                   // stall that triggers auto-unfreeze
   "CpuStressPercent": 90,                // CPU% counting as fully stressed
   "MemStressPercent": 92,                // RAM% counting as fully stressed
-  "PowerPlanBoost": true,                // (admin) High Performance power plan on unfreeze
-  "PowerPlanRestoreAfterSeconds": 120,   // restore previous plan after N s (0 = keep)
-  "RestartExplorerOnUnfreeze": true,     // force-restart explorer.exe on every unfreeze
-  "ResetGpuDriver": true,                // send Ctrl+Shift+Win+B on every unfreeze
-  "RestartDwmOnFrozenScreen": true       // restart dwm.exe if screen still frozen after reset
+  "PowerPlanBoost": false,               // Alt+F4 only: temporary High Performance selection
+  "PowerPlanRestoreAfterSeconds": 120,   // compatibility setting; current bounded runs restore the exact prior plan at run end
+  "ShowCaptureOverlay": true,            // non-activating immediate capture acknowledgement
+  "ShowImmediateCaptureFeedback": true,  // immediate balloon before recovery work starts
+  "PlayRecoverySound": false,            // optional system acknowledgement sound
+  "CaptureOverlayDurationMs": 1200,      // bounded to 250..5000 ms
+  "KeepIncidentHistory": true,           // bounded aggregate receipts in %LOCALAPPDATA%\Thaw
+  "IncidentHistoryLimit": 100,            // bounded to 10..500 receipts
+  "EnableSupportBundleExport": true,     // user-selected ZIP of diagnostics/log/config/receipts
+  "EnableDetailedActionReporting": true,  // persist bounded per-action phase/outcome/detail receipts
+  "EnableWindowsApplicationRestart": true,
+  "ThawWatchdogMode": "off",            // "off" | "relaunch"; Thaw-only child monitor
+   "RescueBrokerMode": "relaunch",       // default; Thaw-only capture/crash fallback monitor
+  "WatchdogHeartbeatSeconds": 15,        // reserved helper heartbeat cadence (bounded)
+  "WatchdogRelaunchDelaySeconds": 3,     // delay before an eligible nonzero-exit relaunch
+  "RestartExplorerOnUnfreeze": false,    // permit restart only if Explorer is measured hung
+  "ResetGpuDriver": true,                // explicit frame-drop/panic profiles
+  "RestartDwmOnFrozenScreen": false      // opt in: detection-gated DWM restart
 }
 ```
+
+Treat this as a conservative reference profile. Existing config values remain user-owned;
+inspect and change them deliberately, then use **Reload Config**. The tray shows whether
+system-level operations are available under the current token.
 
 ---
 
 ## What Thaw deliberately does NOT do (and why)
 
 - **Never suspends/pauses any process** (removed — `NtSuspendProcess` was dropped by request).
-- **Never kills any process except explorer.exe** (explicitly requested).
-- **No dwm.exe kill unless the screen is actually still frozen** (detection-gated).
-- **No service changes** (SysMain/Superfetch etc. are invasive and often counterproductive).
+- **Never kills arbitrary application/service processes.** Explorer can be restarted only
+  by the confirmed shell action or when enabled and measured hung.
+- **No dwm.exe kill except the explicit panic profile**, with configuration plus independent
+  DWM-hung and scheduler-stall evidence; the heuristic is not infallible.
+- **No automatic service, adapter, audio, storage, input, or PnP-device changes**; these
+  surfaces are diagnosed and left for an explicit, informed decision.
 - **No GPU overclocking / no registry writes** (except the "Start with Windows" Run key).
 
 ## Hard limits (physics, not Thaw)
@@ -362,9 +444,13 @@ re-launches with `--elevated` (skips the single-instance mutex).
 - A total kernel panic / hardware deadlock / power failure cannot be fixed by **any**
   user-mode application — nothing can run while the CPU itself is frozen.
 - GPU *hardware* failure and dying disks are outside software's reach.
-- Everything Thaw covers: slow/stutter/unresponsive-but-recovering — screen (GPU reset +
-  DWM rescue), shell (explorer restart), RAM (trim + standby/modified purge + cache flush),
-  scheduling (priority + timer + power plan).
+- Everything Thaw can safely attempt or classify: slow/stutter/unresponsive-but-recovering —
+  screen (GPU reset + optional DWM rescue), shell (Explorer refresh/restart), RAM
+  (pressure-gated trim/cache work), foreground/background scheduling, desktop refresh, and
+  bounded evidence for disk, commit, DPC/ISR, network, GPU, thermal, device, and deadlock
+  causes. Timer resolution is left unchanged. If explicitly enabled, only an Alt+F4 force
+  capture may temporarily select High Performance; that machine-wide change can outlive a
+  crash or power loss and is not a repair guarantee.
 
 ## Verification log (`%LOCALAPPDATA%\Thaw\log.txt`)
 
@@ -372,13 +458,13 @@ Every method logs its outcome — the fastest way to confirm a fix worked:
 
 ```
 [INF] Unfreeze triggered (Hotkey)
-[INF] GPU driver reset sent (Ctrl+Shift+Win+B)
+[INF] GPU reset input accepted (8/8 events)
 [DBG] DWM check: hwnd=0x10048 hung=False
-[INF] Power plan -> High Performance: 0x00000000
+[INF] Power-plan boost skipped by safety policy; active plan left unchanged
 [INF] Standby list purge: NTSTATUS 0x00000000
 [INF] System file cache flush: True
 [INF] explorer killed: True
 [INF] explorer started (fallback)
-[INF] Unfreeze done: ... · tuned 327 processes · boosted 6 apps · +864 MB RAM · GPU reset · explorer restarted
+[INF] Unfreeze done: ... · trimmed 2/187 processes · boosted 1 apps · +864 MB RAM · GPU reset
 [INF] Tray icon re-registered after explorer restart
 ```

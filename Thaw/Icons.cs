@@ -6,9 +6,9 @@ using System.Runtime.InteropServices;
 namespace Thaw;
 
 /// <summary>
-/// Icon artwork for Thaw: a deep-ice-blue disc with white ice cracks and a golden
-/// lightning bolt — "breaking the freeze with power". Drawn with GDI+ at 4x and
-/// downscaled for crisp anti-aliasing at every tray size.
+/// Icon artwork for Thaw: an ice-blue shield/disc, a subtle snowflake, and a
+/// bright thawing bolt. Drawn with GDI+ at 4x and downscaled for crisp
+/// anti-aliasing at every tray size.
 /// </summary>
 internal static class Icons
 {
@@ -18,14 +18,28 @@ internal static class Icons
     // Public entry points
     // ------------------------------------------------------------------
 
-    /// <summary>Creates the tray icon (32px, multi-frame not needed for the tray).</summary>
+    /// <summary>Creates a multi-size tray icon so Windows chooses a sharp native frame.</summary>
     public static Icon CreateTrayIcon(bool alert)
     {
-        using var bmp = Draw(32, alert);
+        var frames = new List<(int, Bitmap)>
+        {
+            (16, Draw(16, alert)),
+            (20, Draw(20, alert)),
+            (24, Draw(24, alert)),
+            (32, Draw(32, alert)),
+            (48, Draw(48, alert)),
+        };
         using var ms = new MemoryStream();
-        WriteIco(ms, new[] { (32, bmp) });
-        ms.Position = 0;
-        return new Icon(ms);
+        try
+        {
+            WriteIco(ms, frames);
+            ms.Position = 0;
+            return new Icon(ms);
+        }
+        finally
+        {
+            foreach (var (_, bmp) in frames) bmp.Dispose();
+        }
     }
 
     /// <summary>Dev helper: writes PNG previews of both icon variants (for visual review).</summary>
@@ -77,39 +91,46 @@ internal static class Icons
 
             float s = big; // unit = 1/10 of canvas in px
 
-            // ---- outer shadow ring ----
-            using (var shadowPen = new Pen(Color.FromArgb(70, 0, 0, 0), s * 0.020f))
-                g.DrawEllipse(shadowPen, s * 0.030f, s * 0.035f, s * 0.940f, s * 0.940f);
+            // ---- outer shadow and icy halo ----
+            using (var shadowPen = new Pen(Color.FromArgb(85, 0, 6, 24), s * 0.032f))
+                g.DrawEllipse(shadowPen, s * 0.030f, s * 0.038f, s * 0.940f, s * 0.940f);
+            using (var halo = new Pen(Color.FromArgb(120, 96, 220, 255), s * 0.012f))
+                g.DrawEllipse(halo, s * 0.025f, s * 0.025f, s * 0.950f, s * 0.950f);
 
             // ---- ice disc ----
             var disc = new RectangleF(s * 0.045f, s * 0.045f, s * 0.910f, s * 0.910f);
             using (var bg = new LinearGradientBrush(
                        disc,
-                       Color.FromArgb(255, 0x33, 0x9B, 0xFF),  // top: bright ice blue
-                       Color.FromArgb(255, 0x0A, 0x2A, 0x6E),  // bottom: deep midnight blue
+                       Color.FromArgb(255, 0x4D, 0xD7, 0xFF),  // top: frozen cyan
+                       Color.FromArgb(255, 0x0B, 0x2B, 0x72),  // bottom: deep ice navy
                        LinearGradientMode.Vertical))
             {
                 g.FillEllipse(bg, disc);
             }
 
-            // ---- glossy top highlight ----
-            using (var gloss = new SolidBrush(Color.FromArgb(46, 255, 255, 255)))
-            {
-                g.FillEllipse(gloss, s * 0.14f, s * 0.10f, s * 0.34f, s * 0.20f);
-            }
+            // ---- soft glass highlight ----
+            using (var gloss = new LinearGradientBrush(
+                       new RectangleF(s * 0.12f, s * 0.08f, s * 0.54f, s * 0.36f),
+                       Color.FromArgb(82, 255, 255, 255),
+                       Color.FromArgb(0, 255, 255, 255),
+                       LinearGradientMode.Vertical))
+                g.FillEllipse(gloss, s * 0.11f, s * 0.08f, s * 0.58f, s * 0.38f);
 
-            // ---- white rim ----
-            using (var rim = new Pen(Color.FromArgb(150, 255, 255, 255), s * 0.011f))
+            // ---- double ice rim ----
+            using (var rim = new Pen(Color.FromArgb(200, 224, 250, 255), s * 0.014f))
                 g.DrawEllipse(rim, disc);
+            using (var innerRim = new Pen(Color.FromArgb(70, 120, 235, 255), s * 0.008f))
+                g.DrawEllipse(innerRim, s * 0.090f, s * 0.090f, s * 0.820f, s * 0.820f);
 
-            // ---- ice cracks (skip below 24px where they become noise) ----
-            if (size >= 24)
-                DrawCracks(g, s);
+            // ---- recognizable snowflake behind the bolt ----
+            DrawSnowflake(g, s, size);
 
             // ---- alert ring ----
             if (alert)
             {
-                using var ring = new Pen(Color.FromArgb(235, 0xEF, 0x44, 0x44), s * 0.030f);
+                using var glow = new Pen(Color.FromArgb(95, 0xFF, 0x45, 0x45), s * 0.060f);
+                g.DrawEllipse(glow, s * 0.055f, s * 0.055f, s * 0.890f, s * 0.890f);
+                using var ring = new Pen(Color.FromArgb(245, 0xFF, 0x63, 0x63), s * 0.026f);
                 g.DrawEllipse(ring, s * 0.055f, s * 0.055f, s * 0.890f, s * 0.890f);
             }
 
@@ -129,42 +150,43 @@ internal static class Icons
         return final;
     }
 
-    private static void DrawCracks(Graphics g, float s)
+    private static void DrawSnowflake(Graphics g, float s, int size)
     {
-        // Six deterministic jagged cracks radiating from the centre.
-        (float angleDeg, float j1, float j2, float len)[] cracks =
+        // A clean six-arm crystal reads at tray scale better than long random
+        // cracks, while the bolt crossing it still communicates "thaw".
+        float radius = size <= 16 ? 0.27f : 0.34f;
+        float start = size <= 16 ? 0.07f : 0.08f;
+        using var pen = new Pen(Color.FromArgb(size <= 16 ? 150 : 175, 224, 249, 255), s * 0.014f)
         {
-            (-160f, -0.020f,  0.028f, 0.46f),
-            (-100f,  0.024f, -0.018f, 0.50f),
-            ( -40f, -0.016f,  0.026f, 0.44f),
-            (  20f,  0.022f, -0.024f, 0.48f),
-            (  80f, -0.026f,  0.016f, 0.46f),
-            ( 140f,  0.020f, -0.022f, 0.50f),
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+        };
+        using var branch = new Pen(Color.FromArgb(size <= 16 ? 115 : 145, 194, 239, 255), s * 0.010f)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
         };
 
-        using var pen = new Pen(Color.FromArgb(175, 255, 255, 255), s * 0.011f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-        using var branch = new Pen(Color.FromArgb(120, 255, 255, 255), s * 0.008f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        PointF Polar(double angle, float distance) => new(
+            s * (0.5f + (float)Math.Cos(angle) * distance),
+            s * (0.5f + (float)Math.Sin(angle) * distance));
 
-        foreach (var (angleDeg, j1, j2, len) in cracks)
+        for (int i = 0; i < 6; i++)
         {
-            double a = angleDeg * Math.PI / 180.0;
-            var dir = new PointF((float)Math.Cos(a), (float)Math.Sin(a));
-            var perp = new PointF(-dir.Y, dir.X);
+            double angle = -Math.PI / 2d + i * Math.PI / 3d;
+            PointF inner = Polar(angle, start);
+            PointF outer = Polar(angle, radius);
+            g.DrawLine(pen, inner, outer);
 
-            PointF P(float f, float j) => new(
-                s * (0.5f + dir.X * f + perp.X * j),
-                s * (0.5f + dir.Y * f + perp.Y * j));
-
-            var p0 = P(0.09f, 0f);
-            var p1 = P(0.26f, j1);
-            var p2 = P(len, j2);
-
-            g.DrawLine(pen, p0, p1);
-            g.DrawLine(pen, p1, p2);
-
-            // small offshoot from the middle joint
-            g.DrawLine(branch, p1, P(0.26f - 0.07f, j1 + (j1 >= 0 ? 0.055f : -0.055f)));
+            float branchStart = radius * 0.61f;
+            float branchLength = radius * 0.22f;
+            PointF branchOrigin = Polar(angle, branchStart);
+            g.DrawLine(branch, branchOrigin, Polar(angle + Math.PI / 3d, branchStart - branchLength));
+            g.DrawLine(branch, branchOrigin, Polar(angle - Math.PI / 3d, branchStart - branchLength));
         }
+
+        using var core = new SolidBrush(Color.FromArgb(190, 224, 249, 255));
+        g.FillEllipse(core, s * 0.465f, s * 0.465f, s * 0.070f, s * 0.070f);
     }
 
     private static void DrawBolt(Graphics g, float s, bool alert)
