@@ -246,6 +246,12 @@ internal static class Program
                     defaults.GetIncidentHistoryLimit() != 100 || defaults.GetWatchdogHeartbeatSeconds() != 15 ||
                     defaults.ShouldRunThawWatchdog || !defaults.ShouldRunRescueBroker)
                     throw new InvalidOperationException("default lifecycle/feedback policy invariant failed");
+                IReadOnlyList<RecoveryHotkeyBinding> fallbackBindings = defaults.GetAlwaysFallbackHotkeys();
+                if (fallbackBindings.Count != 3 ||
+                    !fallbackBindings.Any(binding => binding.Action == RecoveryHotkeyAction.AltF4) ||
+                    fallbackBindings.Select(binding => binding.Chord.Signature)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).Count() != fallbackBindings.Count)
+                    throw new InvalidOperationException("registered fallback hotkey invariant failed");
                 Console.WriteLine("Self-test: PASS — three unique recovery chords, compatibility defaults, and bounded lifecycle policy validated");
             }
             catch (Exception ex)
@@ -343,6 +349,34 @@ internal static class Program
                     throw new InvalidOperationException(
                         $"force-all action graph exceeds the worker capacity or omits a required action ({forceActions.Count}/{RecoveryCoordinator.MaxActionWorkers})");
                 Console.WriteLine($"Self-test: PASS — Alt+F4 action graph contains {forceActions.Count} actions within {RecoveryCoordinator.MaxActionWorkers} pre-warmed workers");
+
+                IReadOnlyList<string> automaticActions = RecoveryCoordinator.SelectCauseDirectedActions(
+                    TriggerReason.Auto,
+                    HealthCause.ResourcePressure,
+                    forceAll: false,
+                    memoryPressure: true,
+                    foregroundHung: true,
+                    dwmHung: true,
+                    explorerHung: true);
+                if (automaticActions.Any(name => name is not "resource-diagnostics" and not "foreground-probe"))
+                    throw new InvalidOperationException("automatic recovery selected a mutating action");
+                Console.WriteLine("Self-test: PASS — automatic stall recovery is diagnostics-only");
+
+                var rollbackJournal = new RollbackJournal();
+                bool rollbackAttempted = false;
+                string rollbackDetail = string.Empty;
+                rollbackJournal.RecordResult("self-test-restore", () =>
+                {
+                    rollbackAttempted = true;
+                    return false;
+                });
+                rollbackJournal.RollbackAll((_, started, detail) =>
+                {
+                    if (!started) rollbackDetail = detail;
+                });
+                if (!rollbackAttempted || !rollbackDetail.StartsWith("rollback failed", StringComparison.Ordinal))
+                    throw new InvalidOperationException("rollback failure receipt invariant failed");
+                Console.WriteLine("Self-test: PASS — failed native restore is surfaced in rollback receipts");
 
                 using var coordinator = new RecoveryCoordinator();
                 var noOpActions = Enumerable.Range(0, RecoveryCoordinator.MaxActionWorkers)
@@ -607,6 +641,8 @@ internal static class Program
                 try { exited = parent.WaitForExit(100); }
                 catch { exited = true; }
                 if (exited) break;
+
+                try { hotkeys?.RefreshConfigurationIfChanged(); } catch { }
 
                 if (broker.Wait(100, out RescueSignal signal))
                     HandleRescueRequest(parent, broker, state, "event:" + signal.Reason);

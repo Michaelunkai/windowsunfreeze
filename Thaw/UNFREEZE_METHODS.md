@@ -109,15 +109,22 @@ operation, not a guaranteed diagnosis or repair.
 **Detection — two signals:**
 1. `IsHungAppWindow(dwmWindow)` — the OS's own hung check. The window is found by
    class name `DwmNotificationWindow` (classic) or `Dwm` (Windows 11 24H2+), falling back to
-   enumerating any top-level window owned by the dwm PID via `EnumWindows` +
-   `GetWindowThreadProcessId`.
+   enumerating any top-level window owned by the validated current-session dwm PID via
+   `EnumWindows` + `GetWindowThreadProcessId`.
 2. Watchdog stall: `Watchdog.LastStallMs >= Config.StallThresholdMs` (latest 1 s sample still
    shows the scheduler frozen).
 
 **Restart:**
 ```csharp
-foreach (var p in Process.GetProcessesByName("dwm")) { p.Kill(); p.WaitForExit(3000); }
-// poll up to 5 s for the system to respawn dwm
+// Resolve exactly one current-session %WINDIR%\\System32\\dwm.exe first.
+// Reject every name-only, wrong-session, wrong-path, or unreadable candidate.
+if (TryGetValidatedDwmProcess(out Process? dwm) && dwm is not null)
+{
+    int oldPid = dwm.Id;
+    dwm.Kill(entireProcessTree: false);
+    dwm.WaitForExit(1500);
+    // Poll only for a different validated dwm.exe before recording success.
+}
 ```
 
 - File: `Unfreezer.cs` → `IsScreenStillFrozen()` / `IsDwmHung()` / `RestartDwm()`.
@@ -313,12 +320,15 @@ default off), then the watchdog takes a 2 s breather. `RecentStall` = stall with
 
 `KeyboardHook.cs` — a global `WH_KEYBOARD_LL` low-level hook installed with
 `SetWindowsHookEx(13, proc, GetModuleHandle(null), 0)` on a dedicated highest-priority
-native message-loop thread independent of `Application.Run`. A 250 ms heartbeat renews the
-hook when needed, while a preallocated dispatch ring and per-user rescue event preserve the
-sub-second activation path. Every key event updates a modifier-state tracker
+native message-loop thread independent of `Application.Run`. A 250/500 ms heartbeat renews
+the primary/emergency hooks and forces a bounded 3/5-second handle renewal when needed,
+while preallocated dispatch workers and a per-user rescue event preserve the sub-second
+activation path. Every key event updates a modifier-state tracker
 (handles **both** generic and left/right VKs: VK_MENU 0x12 / VK_LMENU 0xA4 / VK_RMENU 0xA5,
 VK_CONTROL 0x11 / VK_LCONTROL 0xA2 / VK_RCONTROL 0xA3, VK_SHIFT 0x10 / 0xA0 / 0xA1 — real
 keyboards send the left/right codes; the generic-only bug was caught and fixed).
+Right-Alt is also recognized as AltGr; Ctrl+Alt recovery matching is skipped while AltGr
+text input is active.
 
 **Alt+F4:** on F4 (0x73) keydown with Alt (`LLKHF_ALTDOWN` = flags bit 0x20, or tracked
 state), `_shouldInterceptAltF4()` decides by `AltF4Mode`:
@@ -339,7 +349,7 @@ the configurable debounce window are rejected. Config reload rebuilds the live b
 
 ---
 
-## Capture-path hardening (1.4.0)
+## Capture-path hardening (1.4.1)
 
 The keybind path now has several independent boundaries so a busy UI thread or a damaged
 single hook does not erase the user's emergency request:
@@ -352,23 +362,27 @@ single hook does not erase the user's emergency request:
 2. **Lock-free callback edge** — callbacks use per-hook key state, atomic configuration
    references, a concurrent debounce table, and no synchronous file logging or recovery work.
    Callback faults are counted and passed through to Windows.
-3. **Reserved emergency dispatch slot** — a 32-slot pre-warmed dispatch ring is backed by
-   one reserved slot for the case where cleanup briefly owns the normal queue. A capture is
-   never allowed to run the recovery engine synchronously; if an extreme burst fills both
-   paths, the dropped count is surfaced instead of hiding the loss.
-4. **Persistent dispatch boundary** — the pre-warmed dispatch worker isolates a failed
-   delivery or queue wait, clears only the affected slot, and retries instead of terminating
-   the worker or clearing the entire captured ring.
+3. **Two-tier pre-warmed dispatch** — a 32-slot dispatch ring is backed by one reserved
+   slot for the case where cleanup briefly owns the normal queue, plus a separate worker,
+   wait handle, and final slot for simultaneous ring/worker pressure. A capture is never
+   allowed to run the recovery engine synchronously; only an extreme burst that fills all
+   pre-warmed slots is surfaced as a dropped count.
+4. **Persistent dispatch boundary** — both dispatch workers isolate failed delivery or
+   queue waits, clear only the affected slot, and retry instead of terminating a worker or
+   clearing the entire captured ring. Event subscribers are invoked from a snapshot one at
+   a time, so one throwing consumer cannot prevent later consumers from running.
 5. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
    event and the dispatch worker pulses a paired acknowledgement event only after it has
    delivered the request. Sequence gating is committed only after the native pulse succeeds,
    so a transient event-handle failure remains retryable and duplicate acknowledgements do not
    leave stale fallback pulses.
-6. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
-   `RegisterHotKey` registrations for always-on panic/frame-drop chords. If the main process
-   does not acknowledge a request within the bounded window, it starts one headless,
-   force-all recovery. `Alt+F4` remains low-level-hook-only because `RegisterHotKey` cannot
-   guarantee close suppression.
+6. **In-process and out-of-process registered-hotkey fallback** — the main hook thread and
+   the Thaw-only rescue helper register always-on panic/frame-drop chords, plus Alt+F4 when
+   `AltF4Mode` is `always`. If the main process does not acknowledge a request within the
+   bounded window, the helper starts one headless, force-all recovery. Both registrations
+   re-register after recoverable message-loop failures; the helper also refreshes them after
+   a live config change. RegisterHotKey is a recovery wake-up fallback, not a promise of
+   Alt+F4 close suppression.
 7. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.

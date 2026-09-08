@@ -1,6 +1,6 @@
 # Thaw — Instant Unfreezer ❄⚡
 
-Version **1.4.0**
+Version **1.4.1**
 
 **Thaw** lives in your system tray and provides keyboard-first recovery for a PC that is
 slow, stuttering, dropping frames, or temporarily unresponsive. It does not promise to
@@ -83,23 +83,29 @@ application memory or process dumps.
   The panic hotkey is always intercepted. A hook callback is not proof that recovery
   completed; check the log and the tray result.
 - **Hook resilience** — the hook owns a dedicated highest-priority native message thread,
-  250/500 ms heartbeats, bounded automatic reinstall, a preallocated dispatch ring, and a
+  250/500 ms heartbeats, bounded 3/5-second renewal, a preallocated dispatch ring, and a
   per-user rescue event so WinForms work cannot delay Alt+F4 capture. Version 1.4 adds a
   second independent low-level hook, lock-free callback capture, a reserved emergency
   dispatch slot, callback/drop counters for the rare saturated path, and an independent
   supervisor that recreates a hook thread if its native message loop ever exits. The
-  dispatch worker also isolates delivery/queue exceptions and retries its loop without
-  clearing already-captured requests.
+  dispatch workers also isolate delivery/queue exceptions and retry their loops without
+  clearing already-captured requests; the final worker is an independent pre-warmed
+  last-resort slot. Each event subscriber is isolated individually, and AltGr text input
+  is excluded from Ctrl+Alt recovery matching.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
-  the per-user signal and acknowledgement events. It also registers always-on panic and
-  frame-drop chords with `RegisterHotKey`; if the main process does not acknowledge a
-  capture, the helper starts one headless bounded force-all recovery. This is an emergency
-  fallback, not a second normal recovery loop, and it never runs arbitrary commands.
+  the per-user signal and acknowledgement events. It also registers always-on panic,
+  frame-drop, and Alt+F4 (when `AltF4Mode` is `always`) chords with `RegisterHotKey`; the
+  main process keeps a matching in-process fallback as well. If the main process does not
+  acknowledge a capture, the helper starts one headless bounded force-all recovery. This
+  is an emergency fallback, not a second normal recovery loop, and it never runs arbitrary
+  commands. Its registered-hotkey message loop re-registers after a recoverable
+  message/queue failure and refreshes its registrations after a live config change.
 - **Watchdog** (`Watchdog.cs`) — samples scheduling delay, CPU, and RAM each second.
   It drives the alert icon and can request automatic recovery after a hard stall when
-  `AutoUnfreezeOnStall` is enabled. A failed native/probe sample is isolated and retried
-  instead of terminating the detector. Keep automatic recovery off until you have
-  reviewed the configured actions; a watchdog trigger is not a diagnosis.
+  `AutoUnfreezeOnStall` is enabled. Automatic recovery is deliberately diagnostics-only;
+  explicit shortcuts retain the configured mutation tiers. A failed native/probe sample is
+  isolated and retried instead of terminating the detector, and a watchdog trigger is not
+  a diagnosis.
 - **Telemetry and verification** — a bounded one-Hz ring records scheduler, CPU, RAM,
   commit, disk, DPC/ISR, network, GPU-engine, QoS, foreground-process, and real DWM
   composition/frame evidence. Alt+F4 also starts bounded DWM-frame, foreground WM_NULL and
@@ -115,7 +121,7 @@ application memory or process dumps.
   | Surface | What it attempts | Why it may be disruptive |
   |---|---|---|
   | Display | Sends Ctrl+Shift+Win+B through Windows `SendInput`; a screen blank is possible. | SendInput can be blocked or fail; a reset is not guaranteed. |
-  | DWM | Checks whether the compositor still appears hung, then asks Windows to respawn it when configured. | The display can go black for 1–2 seconds; detection is imperfect. |
+  | DWM | Checks whether the current-session System32 `dwm.exe` appears hung, then asks Windows to respawn that exact validated process when configured. | The display can go black for 1–2 seconds; detection is imperfect. |
   | Memory/cache | Best-effort working-set and system-list/cache operations for eligible resources. | Pages may fault back in; system-wide cache operations need Administrator. |
   | Priority | Temporarily raises Thaw and selected foreground/shell work from Normal to Above Normal, then restores it. | Scheduling priority cannot fix I/O, GPU, thermal, or hardware limits. |
   | Power | Optional Alt+F4-only temporary High Performance selection with exact end-of-run rollback. | It is machine-wide and is not proof of repair. |

@@ -160,7 +160,7 @@ internal sealed class RecoveryActionContext
 /// </summary>
 internal sealed class RollbackJournal
 {
-    private sealed record Entry(string Name, Action Undo);
+    private sealed record Entry(string Name, Func<bool> Undo);
     private readonly object _gate = new();
     private readonly List<Entry> _entries = new();
     private int _rolledBack;
@@ -172,12 +172,27 @@ internal sealed class RollbackJournal
 
     internal void Record(string name, Action undo)
     {
+        if (undo is null) return;
+        RecordResult(name, () =>
+        {
+            undo();
+            return true;
+        });
+    }
+
+    /// <summary>Records a rollback that can report whether the native restore succeeded.</summary>
+    internal void RecordResult(string name, Func<bool> undo)
+    {
         if (string.IsNullOrWhiteSpace(name) || undo is null) return;
         lock (_gate)
         {
             if (Volatile.Read(ref _rolledBack) != 0)
             {
-                try { undo(); } catch (Exception ex) { Log.Debug($"Late rollback for {name} failed: {ex.Message}"); }
+                try
+                {
+                    if (!undo()) Log.Debug($"Late rollback for {name} reported failure");
+                }
+                catch (Exception ex) { Log.Debug($"Late rollback for {name} failed: {ex.Message}"); }
                 return;
             }
             _entries.Add(new Entry(name, undo));
@@ -197,7 +212,12 @@ internal sealed class RollbackJournal
             receipt?.Invoke(entry.Name, true, "rollback started");
             try
             {
-                entry.Undo();
+                if (!entry.Undo())
+                {
+                    Log.Debug($"Rollback reported failure for {entry.Name}");
+                    receipt?.Invoke(entry.Name, false, "rollback failed: native restore returned false");
+                    continue;
+                }
                 restored.Add(entry.Name);
                 receipt?.Invoke(entry.Name, false, "rollback completed");
             }
@@ -715,9 +735,10 @@ internal sealed class RecoveryCoordinator : IDisposable
             task = AvSetMmThreadCharacteristics(taskName, out uint taskIndex);
             if (task == IntPtr.Zero) return false;
             IntPtr captured = task;
-            journal.Record("mmcss", () =>
+            journal.RecordResult("mmcss", () =>
             {
-                try { AvRevertMmThreadCharacteristics(captured); } catch { }
+                try { return AvRevertMmThreadCharacteristics(captured); }
+                catch { return false; }
             });
             Log.Debug($"MMCSS task entered: {taskName}, index={taskIndex}");
             return true;
@@ -735,7 +756,7 @@ internal sealed class RecoveryCoordinator : IDisposable
         if (process == IntPtr.Zero || desired is null || desired.Length == 0) return false;
         if (!TryReadCpuSets(process, out uint[] previous)) return false;
         if (!TryWriteCpuSets(process, desired)) return false;
-        journal.Record("cpu-sets", () => TryWriteCpuSets(process, previous));
+        journal.RecordResult("cpu-sets", () => TryWriteCpuSets(process, previous));
         return true;
     }
 
@@ -819,12 +840,12 @@ internal sealed class RecoveryCoordinator : IDisposable
             if (!SetProcessInformation(handle, ProcessPowerThrottling, ref state, size)) return false;
 
             IntPtr capturedHandle = handle;
-            journal.Record("qos", () =>
+            journal.RecordResult("qos", () =>
             {
                 try
                 {
                     var restore = before;
-                    SetProcessInformation(capturedHandle, ProcessPowerThrottling, ref restore, size);
+                    return SetProcessInformation(capturedHandle, ProcessPowerThrottling, ref restore, size);
                 }
                 finally { Native.CloseHandle(capturedHandle); }
             });
@@ -929,6 +950,13 @@ internal sealed class RecoveryCoordinator : IDisposable
         Add("resource-diagnostics");
         if (foregroundHung || reason is TriggerReason.Hotkey or TriggerReason.Panic)
             Add("foreground-probe");
+
+        // Automatic watchdog recovery must remain evidence-only. A scheduler
+        // delay is not enough evidence to mutate process priority, CPU sets,
+        // memory, display, shell, DNS, or power state without an explicit user
+        // shortcut or manual request.
+        if (reason == TriggerReason.Auto)
+            return selected;
 
         switch (cause)
         {

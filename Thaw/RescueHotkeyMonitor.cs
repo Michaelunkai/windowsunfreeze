@@ -12,22 +12,29 @@ internal sealed class RescueHotkeyMonitor : IDisposable
 {
     private const uint WM_QUIT = 0x0012;
     private const uint WM_APP_STOP = 0x8000 + 0x71;
+    private const uint WM_APP_REFRESH = 0x8000 + 0x72;
     private const uint WM_HOTKEY = (uint)Native.WM_HOTKEY;
     private const int FirstHotkeyId = 0x5B00;
 
-    private readonly Config _config;
+    private readonly string _configPath;
     private readonly Action<RecoveryHotkeyBinding> _onHotkey;
     private readonly object _gate = new();
     private readonly Dictionary<int, RecoveryHotkeyBinding> _registered = new();
     private readonly ManualResetEventSlim _ready = new(false);
     private readonly ManualResetEventSlim _stopped = new(false);
     private readonly Thread _thread;
+    private Config _config;
+    private Config? _pendingConfig;
+    private long _lastConfigProbeTick;
+    private long _lastConfigWriteTicks;
+    private long _lastConfigLength = -1;
     private int _disposed;
     private int _threadId;
 
     internal RescueHotkeyMonitor(Config config, Action<RecoveryHotkeyBinding> onHotkey)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _configPath = Config.DefaultPath();
         _onHotkey = onHotkey ?? throw new ArgumentNullException(nameof(onHotkey));
         _thread = new Thread(ThreadMain)
         {
@@ -55,24 +62,52 @@ internal sealed class RescueHotkeyMonitor : IDisposable
             // RegisterHotKey posts to this thread's queue, so create it before
             // publishing readiness and before the parent can depend on us.
             PeekMessage(out Message initial, IntPtr.Zero, 0, 0, 0);
-            RegisterAlwaysHotkeys();
+            try { RegisterAlwaysHotkeys(); }
+            catch (Exception ex) { Log.Error("Rescue hotkey registration failed; retrying loop", ex); }
             _ready.Set();
 
             while (Volatile.Read(ref _disposed) == 0)
             {
-                int result = GetMessage(out Message message, IntPtr.Zero, 0, 0);
-                if (result <= 0) break;
-                if (message.message == WM_APP_STOP || message.message == WM_QUIT)
-                    break;
-                if (message.message != WM_HOTKEY)
-                    continue;
+                try
+                {
+                    int result = GetMessage(out Message message, IntPtr.Zero, 0, 0);
+                    if (result == 0)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0) break;
+                        ReRegisterAfterMessageLoopFault("WM_QUIT");
+                        continue;
+                    }
+                    if (result < 0)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0) break;
+                        ReRegisterAfterMessageLoopFault("GetMessage error");
+                        try { Thread.Sleep(50); } catch { }
+                        continue;
+                    }
+                    if (message.message == WM_APP_STOP || message.message == WM_QUIT)
+                        break;
+                    if (message.message == WM_APP_REFRESH)
+                    {
+                        ApplyPendingConfiguration();
+                        continue;
+                    }
+                    if (message.message != WM_HOTKEY)
+                        continue;
 
-                RecoveryHotkeyBinding? binding;
-                lock (_gate) _registered.TryGetValue(message.wParam.ToInt32(), out binding);
-                if (binding is null) continue;
+                    RecoveryHotkeyBinding? binding;
+                    lock (_gate) _registered.TryGetValue(message.wParam.ToInt32(), out binding);
+                    if (binding is null) continue;
 
-                try { _onHotkey(binding); }
-                catch (Exception ex) { Log.Error("Rescue hotkey handler failed", ex); }
+                    try { _onHotkey(binding); }
+                    catch (Exception ex) { Log.Error("Rescue hotkey handler failed", ex); }
+                }
+                catch (Exception ex)
+                {
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    Log.Error("Rescue hotkey message loop failed; retrying", ex);
+                    ReRegisterAfterMessageLoopFault(ex.GetType().Name);
+                    try { Thread.Sleep(50); } catch { }
+                }
             }
         }
         catch (Exception ex)
@@ -88,17 +123,92 @@ internal sealed class RescueHotkeyMonitor : IDisposable
         }
     }
 
+    private void ReRegisterAfterMessageLoopFault(string reason)
+    {
+        try { UnregisterAll(); } catch { }
+        try
+        {
+            RegisterAlwaysHotkeys();
+            Log.Info("Rescue hotkeys re-registered after message-loop fault (" + reason + ")");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Rescue hotkey re-registration failed", ex);
+        }
+    }
+
+    /// <summary>
+    /// Cheap helper-side configuration polling. The main process owns the
+    /// authoritative reload path; this keeps the independent RegisterHotKey
+    /// safety net aligned when the JSON changes while Thaw is running.
+    /// </summary>
+    internal void RefreshConfigurationIfChanged()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        long now = Environment.TickCount64;
+        long previous = Interlocked.Read(ref _lastConfigProbeTick);
+        if (previous != 0 && now - previous < 1_000) return;
+        Interlocked.Exchange(ref _lastConfigProbeTick, now);
+
+        try
+        {
+            var info = new FileInfo(_configPath);
+            long writeTicks = info.Exists ? info.LastWriteTimeUtc.Ticks : 0;
+            long length = info.Exists ? info.Length : 0;
+            if (writeTicks == Interlocked.Read(ref _lastConfigWriteTicks) &&
+                length == Interlocked.Read(ref _lastConfigLength))
+                return;
+
+            // Avoid applying a partially written JSON file. If metadata changes
+            // during the read, leave the pending reload for the next poll.
+            Config candidate = Config.Load(_configPath);
+            var after = new FileInfo(_configPath);
+            long afterWriteTicks = after.Exists ? after.LastWriteTimeUtc.Ticks : 0;
+            long afterLength = after.Exists ? after.Length : 0;
+            if (writeTicks != afterWriteTicks || length != afterLength) return;
+
+            lock (_gate) _pendingConfig = candidate;
+            Interlocked.Exchange(ref _lastConfigWriteTicks, writeTicks);
+            Interlocked.Exchange(ref _lastConfigLength, length);
+            int threadId = Volatile.Read(ref _threadId);
+            if (threadId != 0 && !PostThreadMessage((uint)threadId, WM_APP_REFRESH, IntPtr.Zero, IntPtr.Zero))
+                Log.Debug("Rescue hotkey configuration refresh post failed");
+        }
+        catch (Exception ex)
+        {
+            Log.Debug("Rescue hotkey configuration refresh failed: " + ex.Message);
+        }
+    }
+
+    private void ApplyPendingConfiguration()
+    {
+        Config? pending;
+        lock (_gate)
+        {
+            pending = _pendingConfig;
+            _pendingConfig = null;
+        }
+        if (pending is null || Volatile.Read(ref _disposed) != 0) return;
+
+        Volatile.Write(ref _config, pending);
+        try { UnregisterAll(); } catch { }
+        try
+        {
+            RegisterAlwaysHotkeys();
+            Log.Info("Rescue hotkeys re-registered after configuration reload");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Rescue hotkey configuration reload failed", ex);
+        }
+    }
+
     private void RegisterAlwaysHotkeys()
     {
+        Config config = Volatile.Read(ref _config);
         int id = FirstHotkeyId;
-        foreach (RecoveryHotkeyBinding binding in _config.GetRecoveryHotkeys())
+        foreach (RecoveryHotkeyBinding binding in config.GetAlwaysFallbackHotkeys())
         {
-            // RegisterHotKey cannot provide the exact close suppression contract
-            // of WH_KEYBOARD_LL, so Alt+F4 remains exclusively hook-based.
-            if (binding.Mode != RecoveryHotkeyMode.Always ||
-                binding.Action == RecoveryHotkeyAction.AltF4)
-                continue;
-
             uint modifiers = GetNativeModifiers(binding.Chord);
             bool registered = false;
             try

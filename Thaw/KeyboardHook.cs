@@ -82,9 +82,9 @@ internal sealed class KeyboardHook : IDisposable
     private const uint RESCUE_HOOK_TIMER_ID = 0x5449;
     private const int HOOK_HEARTBEAT_INTERVAL_MS = 250;
     private const int HOOK_STALE_MS = 2500;
-    private const int HOOK_RENEWAL_MS = 10000;
+    private const int HOOK_RENEWAL_MS = 3000;
     private const int RESCUE_HOOK_HEARTBEAT_INTERVAL_MS = 500;
-    private const int RESCUE_HOOK_RENEWAL_MS = 15000;
+    private const int RESCUE_HOOK_RENEWAL_MS = 5000;
     private const int HOOK_SUPERVISOR_INTERVAL_MS = 500;
     private const int HOOK_SUPERVISOR_RETRY_MS = 1000;
     private const int DISPATCH_SLOT_COUNT = 32;
@@ -123,9 +123,12 @@ internal sealed class KeyboardHook : IDisposable
     private readonly ManualResetEventSlim _rescueStopped = new(false);
     private readonly ManualResetEventSlim _hookSupervisorStop = new(false);
     private readonly ManualResetEventSlim _hookSupervisorStopped = new(false);
+    private readonly ManualResetEventSlim _fallbackDispatchStopped = new(false);
+    private readonly AutoResetEvent _fallbackDispatchWake = new(false);
     private Thread? _hookThread;
     private Thread? _rescueThread;
     private readonly Thread _dispatchThread;
+    private readonly Thread _fallbackDispatchThread;
     private readonly Thread _hookSupervisorThread;
 
     private RecoveryHotkeyBinding[] _bindings = Array.Empty<RecoveryHotkeyBinding>();
@@ -148,8 +151,10 @@ internal sealed class KeyboardHook : IDisposable
     private long _captureCount;
     private CaptureBox? _lastCapture;
     private readonly Dictionary<int, RecoveryHotkeyBinding> _registeredFallbackHotkeys = new();
-    private readonly DispatchSlot _emergencyDispatchSlot = new() { IsEmergency = true };
+    private readonly DispatchSlot _emergencyDispatchSlot = new();
+    private readonly DispatchSlot _fallbackDispatchSlot = new();
     private int _emergencyDispatchState;
+    private int _fallbackDispatchState;
     private bool _fallbackHotkeysEnabled;
     private int _registeredFallbackHotkeyCount;
     private long _droppedDispatchCount;
@@ -225,7 +230,11 @@ internal sealed class KeyboardHook : IDisposable
         _lastHookInstallTicks = _lastHookCallbackTicks;
         _lastRescueCallbackTicks = _lastHookCallbackTicks;
         _lastRescueInstallTicks = _lastHookCallbackTicks;
-        Volatile.Write(ref _fallbackHotkeysEnabled, !config.ShouldRunRescueBroker);
+        // Keep an in-process RegisterHotKey route even when the independent
+        // rescue helper is enabled. The normal low-level hook swallows the
+        // chord, while either registered route can recover if both hooks are
+        // unavailable; the broker acknowledgement prevents helper duplication.
+        Volatile.Write(ref _fallbackHotkeysEnabled, true);
 
         ApplyConfiguration(config);
 
@@ -242,6 +251,18 @@ internal sealed class KeyboardHook : IDisposable
         };
         SetHighPriority(_dispatchThread);
         _dispatchThread.Start();
+
+        // Keep a second, independent delivery worker pre-warmed. It is only
+        // used when the normal ring and its reserved slot are both occupied,
+        // so a burst or a transient dispatch-worker fault cannot turn a
+        // captured chord into a silent no-op.
+        _fallbackDispatchThread = new Thread(FallbackDispatchThreadMain)
+        {
+            IsBackground = true,
+            Name = "Thaw emergency hotkey dispatch"
+        };
+        SetHighPriority(_fallbackDispatchThread);
+        _fallbackDispatchThread.Start();
 
         StartHookThreadIfNeeded(rescue: false, reason: "initial");
 
@@ -354,10 +375,24 @@ internal sealed class KeyboardHook : IDisposable
                     if (_hookSupervisorStop.Wait(HOOK_SUPERVISOR_INTERVAL_MS)) break;
                 }
                 catch (ObjectDisposedException) { break; }
+                catch (Exception ex)
+                {
+                    Log.Error("Keyboard hook supervisor wait failed; retrying", ex);
+                    try { Thread.Sleep(25); } catch { }
+                    continue;
+                }
 
                 if (Volatile.Read(ref _disposed) != 0) break;
-                EnsureHookPath(rescue: false);
-                EnsureHookPath(rescue: true);
+                try { EnsureHookPath(rescue: false); }
+                catch (Exception ex)
+                {
+                    Log.Error("Primary keyboard hook supervision failed; retrying", ex);
+                }
+                try { EnsureHookPath(rescue: true); }
+                catch (Exception ex)
+                {
+                    Log.Error("Emergency keyboard hook supervision failed; retrying", ex);
+                }
             }
         }
         catch (Exception ex)
@@ -461,7 +496,7 @@ internal sealed class KeyboardHook : IDisposable
     {
         ArgumentNullException.ThrowIfNull(config);
         IReadOnlyList<HotkeyValidationIssue> issues = ApplyConfiguration(config);
-        Volatile.Write(ref _fallbackHotkeysEnabled, !config.ShouldRunRescueBroker);
+        Volatile.Write(ref _fallbackHotkeysEnabled, true);
         _ = RequestReinstall();
         return issues;
     }
@@ -742,6 +777,7 @@ internal sealed class KeyboardHook : IDisposable
                     bool ctrl = IsKeyDown(Native.VK_CONTROL);
                     bool shift = IsKeyDown(Native.VK_SHIFT);
                     bool win = IsKeyDown(0x5B) || IsKeyDown(0x5C);
+                    bool altGr = ctrl && IsKeyDown(0xA5);
 
                     // Keep the exact Alt+F4 swallowing behavior available even if
                     // the primary hook thread is stalled or its handle was removed.
@@ -767,7 +803,7 @@ internal sealed class KeyboardHook : IDisposable
                     {
                         if (binding.Mode == RecoveryHotkeyMode.Off ||
                             !IsModeAllowed(binding.Mode) ||
-                            !Matches(binding.Chord, kbd.vkCode, alt, ctrl, shift, win))
+                            !Matches(binding.Chord, kbd.vkCode, alt, ctrl, shift, win, altGr))
                             continue;
 
                         if (!repeat && TryAccept(binding.Chord.Signature, repeat))
@@ -838,25 +874,23 @@ internal sealed class KeyboardHook : IDisposable
     }
 
     /// <summary>
-    /// RegisterHotKey is a third capture route for always-on non-Alt+F4 chords.
-    /// The out-of-process rescue helper owns this route when enabled; otherwise
-    /// the main process keeps it as a fallback for a policy-blocked low-level hook.
-    /// Alt+F4 is intentionally excluded because RegisterHotKey cannot provide the
-    /// same guaranteed close suppression as WH_KEYBOARD_LL.
+    /// RegisterHotKey is a third capture route for always-on chords.
+    /// The main process keeps this route, and the out-of-process rescue helper
+    /// adds an independent copy when enabled.
+    /// Alt+F4 is included only in its explicit "always" mode. This route can wake
+    /// recovery if both low-level hooks fail, but it cannot promise the same
+    /// close-suppression contract as WH_KEYBOARD_LL.
     /// </summary>
     private void RegisterFallbackHotkeys(string reason)
     {
         UnregisterFallbackHotkeys();
         if (!Volatile.Read(ref _fallbackHotkeysEnabled)) return;
 
-        RecoveryHotkeyBinding[] bindings = Volatile.Read(ref _bindings);
+        Config config = Volatile.Read(ref _config);
+        IReadOnlyList<RecoveryHotkeyBinding> bindings = config.GetAlwaysFallbackHotkeys();
         int nextId = 0x5A00;
         foreach (RecoveryHotkeyBinding binding in bindings)
         {
-            if (binding.Mode != RecoveryHotkeyMode.Always ||
-                binding.Action == RecoveryHotkeyAction.AltF4)
-                continue;
-
             int id = nextId++;
             uint modifiers = GetNativeModifiers(binding.Chord);
             bool registered = false;
@@ -1019,6 +1053,52 @@ internal sealed class KeyboardHook : IDisposable
         }
     }
 
+    /// <summary>
+    /// Independent last-resort delivery worker. This worker has its own wait
+    /// handle, slot, and managed thread so a full normal ring or an unexpected
+    /// dispatch-loop failure does not silently discard an already captured chord.
+    /// </summary>
+    private void FallbackDispatchThreadMain()
+    {
+        try
+        {
+            while (Volatile.Read(ref _disposed) == 0)
+            {
+                try
+                {
+                    _fallbackDispatchWake.WaitOne();
+                    if (Interlocked.CompareExchange(ref _fallbackDispatchState, 2, 1) == 1)
+                    {
+                        try { DeliverDispatch(_fallbackDispatchSlot); }
+                        catch (Exception ex)
+                        {
+                            Log.Error("Emergency hotkey dispatch failed; slot cleared", ex);
+                            try { ClearDispatchSlot(_fallbackDispatchSlot); } catch { }
+                        }
+                    }
+
+                    if (Volatile.Read(ref _disposed) != 0)
+                        break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Emergency hotkey dispatch loop failed; retrying", ex);
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    try { Thread.Sleep(25); } catch { }
+                }
+            }
+        }
+        finally
+        {
+            try { ClearDispatchSlot(_fallbackDispatchSlot); } catch { }
+            _fallbackDispatchStopped.Set();
+        }
+    }
+
     private bool TryTakeDispatch(out DispatchSlot slot)
     {
         lock (_dispatchGate)
@@ -1053,12 +1133,25 @@ internal sealed class KeyboardHook : IDisposable
         bool delivered = false;
         if (Volatile.Read(ref _disposed) == 0)
         {
-            try
+            Delegate[]? subscribers = RecoveryActionRequested?.GetInvocationList();
+            if (subscribers is not null)
             {
-                RecoveryActionRequested?.Invoke(this, args);
-                delivered = RecoveryActionRequested is not null;
+                foreach (Delegate subscriber in subscribers)
+                {
+                    try
+                    {
+                        ((EventHandler<RecoveryHotkeyEventArgs>)subscriber)(this, args);
+                        delivered = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Multicast event invocation stops at the first
+                        // throwing subscriber. Invoke the snapshot one handler
+                        // at a time so later recovery consumers still run.
+                        Log.Error("Recovery hotkey event handler failed", ex);
+                    }
+                }
             }
-            catch (Exception ex) { Log.Error("Recovery hotkey event handler failed", ex); }
 
             if (legacyCallback is not null)
             {
@@ -1076,11 +1169,19 @@ internal sealed class KeyboardHook : IDisposable
 
     private void ClearDispatchSlot(DispatchSlot slot)
     {
-        if (slot.IsEmergency)
+        if (ReferenceEquals(slot, _emergencyDispatchSlot))
         {
             slot.Args = null;
             slot.LegacyCallback = null;
             Volatile.Write(ref _emergencyDispatchState, 0);
+            return;
+        }
+
+        if (ReferenceEquals(slot, _fallbackDispatchSlot))
+        {
+            slot.Args = null;
+            slot.LegacyCallback = null;
+            Volatile.Write(ref _fallbackDispatchState, 0);
             return;
         }
 
@@ -1106,6 +1207,12 @@ internal sealed class KeyboardHook : IDisposable
             {
                 _emergencyDispatchSlot.Args = null;
                 _emergencyDispatchSlot.LegacyCallback = null;
+            }
+
+            if (Interlocked.CompareExchange(ref _fallbackDispatchState, 0, 1) == 1)
+            {
+                _fallbackDispatchSlot.Args = null;
+                _fallbackDispatchSlot.LegacyCallback = null;
             }
         }
     }
@@ -1148,6 +1255,7 @@ internal sealed class KeyboardHook : IDisposable
                     bool ctrl = _ctrlDown;
                     bool shift = _shiftDown;
                     bool win = _winDown;
+                    bool altGr = ctrl && IsKeyDown(0xA5);
 
                     // Alt+F4 is deliberately handled as its own legacy mode and remains
                     // collision-free with the validated two-modifier table.
@@ -1177,7 +1285,7 @@ internal sealed class KeyboardHook : IDisposable
                     {
                         if (binding.Mode == RecoveryHotkeyMode.Off ||
                             !IsModeAllowed(binding.Mode) ||
-                            !Matches(binding.Chord, kbd.vkCode, alt, ctrl, shift, win))
+                            !Matches(binding.Chord, kbd.vkCode, alt, ctrl, shift, win, altGr))
                             continue;
 
                         bool accepted = !repeat && TryAccept(binding.Chord.Signature, repeat);
@@ -1254,7 +1362,8 @@ internal sealed class KeyboardHook : IDisposable
         bool alt,
         bool ctrl,
         bool shift,
-        bool win)
+        bool win,
+        bool altGr)
     {
         if (vk != (uint)chord.Vk) return false;
 
@@ -1265,6 +1374,11 @@ internal sealed class KeyboardHook : IDisposable
         shift |= (Native.GetAsyncKeyState(Native.VK_SHIFT) & 0x8000) != 0;
         win |= (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 ||
                (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+        altGr |= ctrl && (Native.GetAsyncKeyState(0xA5) & 0x8000) != 0;
+        // Right-Alt is reported as Ctrl+Alt by Windows on many keyboard
+        // layouts. Do not steal ordinary AltGr text input just because a
+        // user-defined recovery chord happens to use the same modifiers.
+        if (altGr && chord.Alt && chord.Ctrl) return false;
         return alt == chord.Alt && ctrl == chord.Ctrl && shift == chord.Shift && win == chord.Win;
     }
 
@@ -1354,9 +1468,30 @@ internal sealed class KeyboardHook : IDisposable
             return true;
         }
 
-        // This is only reachable after an unusually large burst of accepted chords.
-        // Never run recovery synchronously in WH_KEYBOARD_LL while the machine is
-        // under pressure; expose the loss in diagnostics instead.
+        // A second pre-warmed worker owns the final non-blocking delivery slot.
+        // It is independent of the normal dispatch wait handle and therefore
+        // remains useful if that worker is stalled or its ring is saturated.
+        if (Interlocked.CompareExchange(ref _fallbackDispatchState, EMERGENCY_WRITING, 0) == 0)
+        {
+            _fallbackDispatchSlot.Args = args;
+            _fallbackDispatchSlot.LegacyCallback = legacyCallback;
+            Volatile.Write(ref _fallbackDispatchState, 1);
+            try
+            {
+                _fallbackDispatchWake.Set();
+                return true;
+            }
+            catch
+            {
+                _fallbackDispatchSlot.Args = null;
+                _fallbackDispatchSlot.LegacyCallback = null;
+                Volatile.Write(ref _fallbackDispatchState, 0);
+            }
+        }
+
+        // This is only reachable after an unusually large burst or simultaneous
+        // failure of both pre-warmed dispatch workers. Never run recovery
+        // synchronously in WH_KEYBOARD_LL while the machine is under pressure.
         Interlocked.Increment(ref _droppedDispatchCount);
         return false;
     }
@@ -1463,6 +1598,18 @@ internal sealed class KeyboardHook : IDisposable
 
         bool dispatchStopped = Thread.CurrentThread == _dispatchThread || !_dispatchThread.IsAlive;
 
+        // Wake and join the independent last-resort delivery worker before
+        // disposing its wait handle. It owns a separate slot and event from
+        // the normal dispatch path.
+        try { _fallbackDispatchWake.Set(); } catch { }
+        if (Thread.CurrentThread != _fallbackDispatchThread)
+        {
+            try { _fallbackDispatchThread.Join(2000); } catch { }
+            try { _fallbackDispatchStopped.Wait(2000); } catch { }
+        }
+        bool fallbackDispatchStopped = Thread.CurrentThread == _fallbackDispatchThread ||
+                                       !_fallbackDispatchThread.IsAlive;
+
         if (hookThreadOwn)
             RemoveHook();
         else if (!hookStopped)
@@ -1481,6 +1628,11 @@ internal sealed class KeyboardHook : IDisposable
         if (dispatchStopped)
         {
             try { _dispatchWake.Dispose(); } catch { }
+        }
+        if (fallbackDispatchStopped)
+        {
+            try { _fallbackDispatchWake.Dispose(); } catch { }
+            try { _fallbackDispatchStopped.Dispose(); } catch { }
         }
         if (hookStopped)
         {
@@ -1590,7 +1742,6 @@ internal sealed class KeyboardHook : IDisposable
 
     private sealed class DispatchSlot
     {
-        public bool IsEmergency;
         public RecoveryHotkeyEventArgs? Args;
         public Action? LegacyCallback;
     }

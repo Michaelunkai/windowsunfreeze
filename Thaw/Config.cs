@@ -179,6 +179,34 @@ internal sealed class Config
         return BuildRecoveryHotkeys(null);
     }
 
+    /// <summary>
+    /// Returns the always-on bindings that can use RegisterHotKey as a fallback
+    /// when a low-level hook path is unavailable. Alt+F4 is included only when
+    /// its explicit mode is "always"; RegisterHotKey cannot guarantee the same
+    /// close-suppression contract as WH_KEYBOARD_LL, but it can still wake the
+    /// recovery path when both low-level hooks are unavailable.
+    /// </summary>
+    internal IReadOnlyList<RecoveryHotkeyBinding> GetAlwaysFallbackHotkeys()
+    {
+        IReadOnlyList<RecoveryHotkeyBinding> configured = GetRecoveryHotkeys();
+        var result = new List<RecoveryHotkeyBinding>(configured.Count + 1);
+        if (string.Equals(AltF4Mode?.Trim(), "always", StringComparison.OrdinalIgnoreCase))
+        {
+            result.Add(new RecoveryHotkeyBinding(
+                RecoveryHotkeyAction.AltF4,
+                RecoveryHotkeyMode.Always,
+                nameof(AltF4Mode),
+                new RecoveryHotkeyChord(true, false, false, false, 0x73, "Alt+F4")));
+        }
+
+        foreach (RecoveryHotkeyBinding binding in configured)
+        {
+            if (binding.Mode == RecoveryHotkeyMode.Always)
+                result.Add(binding);
+        }
+        return result;
+    }
+
     /// <summary>Returns validation diagnostics without mutating the user's raw JSON values.</summary>
     internal IReadOnlyList<HotkeyValidationIssue> ValidateHotkeys()
     {

@@ -289,9 +289,10 @@ internal sealed class Unfreezer : IDisposable
                 {
                     self.PriorityClass = ProcessPriorityClass.AboveNormal;
                     processPriorityChanged = true;
-                    journal.Record("thaw-priority", () =>
+                    journal.RecordResult("thaw-priority", () =>
                     {
-                        try { Native.SetPriorityClass(Native.GetCurrentProcess(), Native.NORMAL_PRIORITY_CLASS); } catch { }
+                        try { return Native.SetPriorityClass(Native.GetCurrentProcess(), Native.NORMAL_PRIORITY_CLASS); }
+                        catch { return false; }
                     });
                 }
             }
@@ -302,9 +303,14 @@ internal sealed class Unfreezer : IDisposable
                 oldThreadPriority = Thread.CurrentThread.Priority;
                 oldThreadPriorityCaptured = true;
                 Thread.CurrentThread.Priority = ThreadPriority.Highest;
-                journal.Record("thaw-thread-priority", () =>
+                journal.RecordResult("thaw-thread-priority", () =>
                 {
-                    try { Thread.CurrentThread.Priority = oldThreadPriority; } catch { }
+                    try
+                    {
+                        Thread.CurrentThread.Priority = oldThreadPriority;
+                        return true;
+                    }
+                    catch { return false; }
                 });
             }
             catch (Exception ex) { Log.Debug("Managed worker priority unavailable: " + ex.Message); }
@@ -887,7 +893,10 @@ internal sealed class Unfreezer : IDisposable
         _lastWorkingSetFailures = 0;
         _lastAppsBoosted = 0;
         var actions = new List<RecoveryActionSpec>(RecoveryCoordinator.MaxActionWorkers);
-        bool Wants(string name) => forceAll || selected.Contains(name, StringComparer.OrdinalIgnoreCase);
+        bool Wants(string name) =>
+            (reason != TriggerReason.Auto ||
+             name is "resource-diagnostics" or "foreground-probe") &&
+            (forceAll || selected.Contains(name, StringComparer.OrdinalIgnoreCase));
 
         RecoveryActionSpec Add(
             string name,
@@ -1401,9 +1410,9 @@ internal sealed class Unfreezer : IDisposable
                 return false;
             if (!Native.SetPriorityClass(handle, Native.ABOVE_NORMAL_PRIORITY_CLASS)) return false;
             IntPtr captured = handle;
-            journal.Record("priority-pid-" + pid, () =>
+            journal.RecordResult("priority-pid-" + pid, () =>
             {
-                try { Native.SetPriorityClass(captured, previous); }
+                try { return Native.SetPriorityClass(captured, previous); }
                 finally { Native.CloseHandle(captured); }
             });
             handle = IntPtr.Zero;
@@ -1434,9 +1443,9 @@ internal sealed class Unfreezer : IDisposable
             const uint BelowNormalPriorityClass = 0x00004000;
             if (!Native.SetPriorityClass(handle, BelowNormalPriorityClass)) return false;
             IntPtr captured = handle;
-            journal.Record("priority-demotion-pid-" + pid, () =>
+            journal.RecordResult("priority-demotion-pid-" + pid, () =>
             {
-                try { Native.SetPriorityClass(captured, previous); }
+                try { return Native.SetPriorityClass(captured, previous); }
                 finally { Native.CloseHandle(captured); }
             });
             handle = IntPtr.Zero;
@@ -1460,10 +1469,14 @@ internal sealed class Unfreezer : IDisposable
             Log.Debug("Power-plan boost unavailable: " + output);
             return false;
         }
-        journal.Record("power-plan", () =>
+        journal.RecordResult("power-plan", () =>
         {
             if (!RunPowerCfg(out string restoreOutput, "/setactive", previous))
+            {
                 Log.Debug("Power-plan rollback unavailable: " + restoreOutput);
+                return false;
+            }
+            return true;
         });
         Log.Info("Power plan force-all boost accepted; exact rollback journal armed");
         return true;
@@ -1714,14 +1727,11 @@ internal sealed class Unfreezer : IDisposable
     /// </summary>
     private static bool IsDwmHung()
     {
-        uint dwmPid = 0;
-        try
-        {
-            using var p = Process.GetProcessesByName("dwm").FirstOrDefault();
-            if (p is not null) dwmPid = (uint)p.Id;
-        }
-        catch { }
-        if (dwmPid == 0) return false;
+        if (!TryGetValidatedDwmProcess(out Process? compositor) || compositor is null)
+            return false;
+
+        using Process p = compositor;
+        uint dwmPid = (uint)p.Id;
 
         IntPtr wnd = Native.FindWindow("DwmNotificationWindow", null);
         if (wnd == IntPtr.Zero) wnd = Native.FindWindow("Dwm", null);
@@ -1752,6 +1762,72 @@ internal sealed class Unfreezer : IDisposable
     }
 
     /// <summary>
+    /// Resolves only the current-session compositor whose executable is the
+    /// Windows System32 dwm.exe. Process.GetProcessesByName alone is not a
+    /// sufficient termination target because names can be spoofed and other
+    /// sessions can contain a compositor too.
+    /// </summary>
+    private static bool TryGetValidatedDwmProcess(out Process? process)
+    {
+        process = null;
+        string windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        if (string.IsNullOrWhiteSpace(windowsDirectory))
+            windowsDirectory = Environment.GetEnvironmentVariable("WINDIR") ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(windowsDirectory)) return false;
+
+        string expectedPath;
+        try { expectedPath = Path.GetFullPath(Path.Combine(windowsDirectory, "System32", "dwm.exe")); }
+        catch { return false; }
+
+        int currentSession;
+        try
+        {
+            using Process current = Process.GetCurrentProcess();
+            currentSession = current.SessionId;
+        }
+        catch { return false; }
+
+        Process[] candidates;
+        try { candidates = Process.GetProcessesByName("dwm"); }
+        catch { return false; }
+
+        foreach (Process candidate in candidates)
+        {
+            bool keep = false;
+            try
+            {
+                if (candidate.SessionId == currentSession)
+                {
+                    string? imagePath = candidate.MainModule?.FileName;
+                    if (!string.IsNullOrWhiteSpace(imagePath) &&
+                        string.Equals(Path.GetFullPath(imagePath), expectedPath,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        process = candidate;
+                        keep = true;
+                    }
+                }
+            }
+            catch { }
+
+            if (keep) break;
+            try { candidate.Dispose(); } catch { }
+        }
+
+        if (process is not null)
+        {
+            foreach (Process candidate in candidates)
+            {
+                if (!ReferenceEquals(process, candidate))
+                {
+                    try { candidate.Dispose(); } catch { }
+                }
+            }
+        }
+        return process is not null;
+    }
+
+    /// <summary>
     /// Restarts the desktop compositor: terminates dwm.exe and lets Windows respawn it.
     /// The screen goes black for ~1–2 s, then the compositor comes back fresh.
     /// </summary>
@@ -1767,12 +1843,12 @@ internal sealed class Unfreezer : IDisposable
         Process? target = null;
         try
         {
-            // Only target the known compositor process, and at most one PID.  No
-            // name-based broad kill or process-tree termination is permitted.
-            target = Process.GetProcessesByName("dwm").FirstOrDefault();
-            if (target is null)
+            // Only target a validated current-session System32 compositor, and
+            // at most one PID. No name-based broad kill or process-tree
+            // termination is permitted.
+            if (!TryGetValidatedDwmProcess(out target) || target is null)
             {
-                counters.Skipped("dwm-restart", "process-not-found");
+                counters.Skipped("dwm-restart", "validated-process-not-found");
                 return false;
             }
             int pid = target.Id;
@@ -1792,11 +1868,17 @@ internal sealed class Unfreezer : IDisposable
             {
                 try
                 {
-                    if (Process.GetProcessesByName("dwm").Length > 0)
+                    if (TryGetValidatedDwmProcess(out Process? replacementCandidate) &&
+                        replacementCandidate is not null)
                     {
-                        Log.Info($"dwm respawned after terminating PID {pid}");
-                        counters.Succeeded("dwm-restart", $"pid={pid}");
-                        return true;
+                        using Process replacement = replacementCandidate;
+                        if (replacement.Id != pid)
+                        {
+                            Log.Info($"validated dwm.exe respawned after terminating PID {pid}; " +
+                                     $"replacement PID {replacement.Id}");
+                            counters.Succeeded("dwm-restart", $"pid={pid},replacement={replacement.Id}");
+                            return true;
+                        }
                     }
                 }
                 catch { }
