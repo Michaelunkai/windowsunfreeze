@@ -356,17 +356,20 @@ single hook does not erase the user's emergency request:
    one reserved slot for the case where cleanup briefly owns the normal queue. A capture is
    never allowed to run the recovery engine synchronously; if an extreme burst fills both
    paths, the dropped count is surfaced instead of hiding the loss.
-4. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
+4. **Persistent dispatch boundary** — the pre-warmed dispatch worker isolates a failed
+   delivery or queue wait, clears only the affected slot, and retries instead of terminating
+   the worker or clearing the entire captured ring.
+5. **Named signal plus acknowledgement** — the capture edge pulses a per-user `Local\\`
    event and the dispatch worker pulses a paired acknowledgement event only after it has
    delivered the request. Sequence gating is committed only after the native pulse succeeds,
    so a transient event-handle failure remains retryable and duplicate acknowledgements do not
    leave stale fallback pulses.
-5. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
+6. **Out-of-process registered-hotkey fallback** — the Thaw-only rescue helper owns
    `RegisterHotKey` registrations for always-on panic/frame-drop chords. If the main process
    does not acknowledge a request within the bounded window, it starts one headless,
    force-all recovery. `Alt+F4` remains low-level-hook-only because `RegisterHotKey` cannot
    guarantee close suppression.
-6. **Capture telemetry** — support diagnostics expose primary/emergency installation,
+7. **Capture telemetry** — support diagnostics expose primary/emergency installation,
    registered fallback count, available capture path, capture count, dispatch drops, callback
    faults, and the most recent captured chord.
 

@@ -87,7 +87,9 @@ application memory or process dumps.
   per-user rescue event so WinForms work cannot delay Alt+F4 capture. Version 1.4 adds a
   second independent low-level hook, lock-free callback capture, a reserved emergency
   dispatch slot, callback/drop counters for the rare saturated path, and an independent
-  supervisor that recreates a hook thread if its native message loop ever exits.
+  supervisor that recreates a hook thread if its native message loop ever exits. The
+  dispatch worker also isolates delivery/queue exceptions and retries its loop without
+  clearing already-captured requests.
 - **Rescue fallback** — when `RescueBrokerMode` is `relaunch`, a Thaw-only helper watches
   the per-user signal and acknowledgement events. It also registers always-on panic and
   frame-drop chords with `RegisterHotKey`; if the main process does not acknowledge a

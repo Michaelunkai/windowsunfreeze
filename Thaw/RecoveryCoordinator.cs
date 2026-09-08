@@ -567,30 +567,70 @@ internal sealed class RecoveryCoordinator : IDisposable
         {
             try
             {
-                _workAvailable.Wait(100);
+                try
+                {
+                    _workAvailable.Wait(100);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Dispose can race the final worker wake-up. The coordinator is
+                    // already shutting down, so this worker has no work to resume.
+                    break;
+                }
+                if (_stop) break;
+
+                while (true)
+                {
+                    RecoveryDispatch.PendingAction? item = null;
+                    lock (_gate)
+                    {
+                        if (_queue.Count > 0) item = _queue.Dequeue();
+                        else
+                        {
+                            try { _workAvailable.Reset(); }
+                            catch (ObjectDisposedException) { _stop = true; }
+                        }
+                    }
+                    if (item is null) break;
+
+                    try
+                    {
+                        Execute(item);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Execute normally contains its own action guard. Keep
+                        // this outer boundary too: an unexpected coordinator
+                        // failure must complete the slot and leave the worker
+                        // available for the next shortcut.
+                        Log.Error("Recovery worker execution failed; continuing", ex);
+                        try
+                        {
+                            item.Batch?.Complete(item, RecoveryOutcome.Unverified,
+                                "worker exception: " + ex.GetType().Name);
+                        }
+                        catch { }
+                    }
+                    finally
+                    {
+                        try { item.Batch?.WorkerFinished(); }
+                        catch (Exception ex) { Log.Debug("Recovery worker drain accounting failed: " + ex.Message); }
+                    }
+                }
             }
             catch (ObjectDisposedException)
             {
-                // Dispose can race the final worker wake-up. The coordinator is
-                // already shutting down, so this worker has no work to resume.
                 break;
             }
-            if (_stop) break;
-            while (true)
+            catch (Exception ex)
             {
-                RecoveryDispatch.PendingAction? item = null;
-                lock (_gate)
+                // A failure in the reusable wait/queue boundary must not
+                // permanently remove one of the pre-warmed recovery workers.
+                Log.Error("Recovery worker loop failed; retrying", ex);
+                if (!_stop)
                 {
-                    if (_queue.Count > 0) item = _queue.Dequeue();
-                    else
-                    {
-                        try { _workAvailable.Reset(); }
-                        catch (ObjectDisposedException) { _stop = true; }
-                    }
+                    try { Thread.Sleep(25); } catch { }
                 }
-                if (item is null) break;
-                try { Execute(item); }
-                finally { item.Batch?.WorkerFinished(); }
             }
         }
     }

@@ -976,26 +976,42 @@ internal sealed class KeyboardHook : IDisposable
         Volatile.Write(ref _dispatchThreadId, unchecked((int)GetCurrentThreadId()));
         try
         {
-            while (true)
+            while (Volatile.Read(ref _disposed) == 0)
             {
-                _dispatchWake.WaitOne();
-                while (TryTakeDispatch(out DispatchSlot slot))
+                try
                 {
-                    DeliverDispatch(slot);
-                    if (Volatile.Read(ref _disposed) != 0) ClearDispatchSlot(slot);
-                }
+                    _dispatchWake.WaitOne();
+                    while (TryTakeDispatch(out DispatchSlot slot))
+                    {
+                        try { DeliverDispatch(slot); }
+                        catch (Exception ex)
+                        {
+                            // Delivery is already isolated per subscriber, but
+                            // retain a last-resort guard around the whole slot so
+                            // one unexpected queue/managed failure cannot strand
+                            // the emergency slot or kill the dispatch worker.
+                            Log.Error("Hotkey dispatch delivery failed; slot cleared", ex);
+                            try { ClearDispatchSlot(slot); } catch { }
+                        }
+                    }
 
-                if (Volatile.Read(ref _disposed) != 0)
+                    if (Volatile.Read(ref _disposed) != 0)
+                    {
+                        ClearQueuedDispatch();
+                        break;
+                    }
+                }
+                catch (ObjectDisposedException)
                 {
-                    ClearQueuedDispatch();
                     break;
                 }
+                catch (Exception ex)
+                {
+                    Log.Error("Hotkey dispatch loop failed; retrying", ex);
+                    if (Volatile.Read(ref _disposed) != 0) break;
+                    try { Thread.Sleep(25); } catch { }
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Hotkey dispatch thread failed", ex);
-            ClearQueuedDispatch();
         }
         finally
         {
